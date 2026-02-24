@@ -1,0 +1,318 @@
+"""App-level integration tests using Textual's run_test framework.
+
+These tests start the real app in headless mode and drive it via Pilot.
+Only the tmux server is mocked (external boundary) — all internal functions
+run for real against a redirected state directory.
+"""
+
+import shutil
+
+import git as gitpython
+import pytest
+from unittest.mock import MagicMock
+
+from textual.widgets import Input
+
+from super_worker.app import SuperWorkerApp, WorktreeTabContent
+from super_worker.screens import (
+    CommitMessageScreen,
+    ConfigScreen,
+    ConfirmDeleteScreen,
+    NewSessionScreen,
+    NewWorktreeScreen,
+    RenameSessionScreen,
+)
+from super_worker.models import Worktree
+from super_worker.widgets.sidebar import SessionDeleted
+from super_worker.widgets.terminal_pane import TerminalPane
+
+
+def _make_mock_server():
+    """Create a mock libtmux server that satisfies all tmux operations."""
+    mock_session = MagicMock()
+    mock_session.session_name = "sw-test-0"
+    mock_session.active_pane = MagicMock()
+    mock_session.active_pane.capture_pane.return_value = ["test output"]
+    mock_session.show_environment.return_value = {}
+
+    mock_server = MagicMock()
+    mock_server.sessions = [mock_session]
+    mock_server.new_session.return_value = mock_session
+    return mock_server
+
+
+@pytest.fixture(autouse=True)
+def isolate_externals(tmp_path, monkeypatch):
+    """Mock only the tmux server and redirect state dir — everything else is real."""
+    # Redirect state storage to temp dir
+    state_dir = tmp_path / "sw-state"
+    state_dir.mkdir()
+    monkeypatch.setattr("super_worker.services.state.STATE_DIR", state_dir)
+
+    # Mock only the tmux daemon boundary
+    mock_server = _make_mock_server()
+    monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+
+
+@pytest.mark.asyncio
+async def test_app_starts():
+    """App starts without import errors or initialization crashes."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        assert app.is_running
+        assert len(app._state.worktrees) >= 1
+
+
+@pytest.mark.asyncio
+async def test_new_worktree_modal_opens():
+    """Ctrl+N opens the NewWorktreeScreen modal."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert isinstance(app.screen, NewWorktreeScreen)
+
+
+@pytest.mark.asyncio
+async def test_new_worktree_modal_cancel():
+    """Escape dismisses NewWorktreeScreen."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert isinstance(app.screen, NewWorktreeScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, NewWorktreeScreen)
+
+
+@pytest.mark.asyncio
+async def test_new_worktree_creates_tab(monkeypatch):
+    """Submitting NewWorktreeScreen creates a worktree and adds a tab."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        # Patch only the git worktree creation (external git side effect).
+        # The mock must create the directory on disk — real git worktree add does this.
+        wt_dir = app._config.base_dir / f"{app._config.worktree_prefix}-test-feat"
+
+        def fake_worktree_cmd(*args):
+            if args[0] == "add":
+                # Simulate git creating the worktree directory
+                wt_dir.mkdir(parents=True, exist_ok=True)
+
+        mock_repo = MagicMock()
+        mock_repo.git.rev_parse.side_effect = gitpython.GitCommandError("rev-parse", 1)
+        mock_repo.git.worktree.side_effect = fake_worktree_cmd
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        initial_count = len(app._state.worktrees)
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert isinstance(app.screen, NewWorktreeScreen)
+
+        app.screen.query_one("#wt-name", Input).value = "test-feat"
+        await pilot.press("enter")
+        await pilot.pause(delay=2.0)
+
+        assert len(app._state.worktrees) == initial_count + 1
+        assert app._active_worktree is not None
+        assert app._active_worktree.name == "test-feat"
+
+        # Cleanup
+        if wt_dir.exists():
+            shutil.rmtree(wt_dir)
+
+
+@pytest.mark.asyncio
+async def test_new_session_modal_opens():
+    """Ctrl+S opens the NewSessionScreen when a worktree is active."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        app._active_worktree = app._state.worktrees[0]
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, NewSessionScreen)
+
+
+@pytest.mark.asyncio
+async def test_new_session_cancel():
+    """Escape dismisses NewSessionScreen without creating a session."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        app._active_worktree = app._state.worktrees[0]
+        initial_sessions = len(app._state.worktrees[0].sessions)
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, NewSessionScreen)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, NewSessionScreen)
+        assert len(app._state.worktrees[0].sessions) == initial_sessions
+
+
+@pytest.mark.asyncio
+async def test_new_session_creates_session():
+    """Submitting NewSessionScreen creates a session via real create_session."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        wt = app._state.worktrees[0]
+        initial_sessions = len(wt.sessions)
+        app._active_worktree = wt
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, NewSessionScreen)
+
+        await pilot.press("enter")
+        await pilot.pause(delay=2.0)
+
+        assert len(wt.sessions) == initial_sessions + 1
+        assert app._active_session_name == wt.sessions[-1].tmux_session_name
+
+
+@pytest.mark.asyncio
+async def test_rename_session_modal_opens():
+    """Ctrl+R opens RenameSessionScreen when a session is active."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        wt = app._state.worktrees[0]
+        session = wt.sessions[0]
+        app._active_worktree = wt
+        app._active_session_name = session.tmux_session_name
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert isinstance(app.screen, RenameSessionScreen)
+
+
+@pytest.mark.asyncio
+async def test_rename_session_updates_label():
+    """Renaming a session via modal updates the session label."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        wt = app._state.worktrees[0]
+        session = wt.sessions[0]
+        app._active_worktree = wt
+        app._active_session_name = session.tmux_session_name
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert isinstance(app.screen, RenameSessionScreen)
+
+        app.screen.query_one("#rename-input", Input).value = "renamed"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert session.label == "renamed"
+
+
+@pytest.mark.asyncio
+async def test_delete_main_worktree_blocked():
+    """Cannot delete the main worktree."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        app._active_worktree = app._state.worktrees[0]
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        assert not isinstance(app.screen, ConfirmDeleteScreen)
+
+
+@pytest.mark.asyncio
+async def test_delete_worktree_opens_confirm():
+    """Ctrl+D opens ConfirmDeleteScreen for non-main worktrees."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        wt = Worktree(name="feature", path=str(app._config.repo_root), branch="sw-feature")
+        app._state.worktrees.append(wt)
+        app._active_worktree = wt
+
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmDeleteScreen)
+
+
+@pytest.mark.asyncio
+async def test_commit_dialog_opens():
+    """Git commit action opens the CommitMessageScreen."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        wt = app._state.worktrees[0]
+        app._active_worktree = wt
+        app._git_commit(wt)
+        await pilot.pause()
+        assert isinstance(app.screen, CommitMessageScreen)
+
+
+@pytest.mark.asyncio
+async def test_settings_modal_opens():
+    """Ctrl+E opens ConfigScreen."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+e")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfigScreen)
+
+
+@pytest.mark.asyncio
+async def test_no_active_session_warns_on_rename():
+    """Ctrl+R with no active session does not crash."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        app._active_session_name = None
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert not isinstance(app.screen, RenameSessionScreen)
+
+
+@pytest.mark.asyncio
+async def test_no_active_session_warns_on_attach():
+    """Ctrl+A with no active session does not crash."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        app._active_worktree = None
+        app._active_session_name = None
+        await pilot.press("ctrl+a")
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_delete_session_removes_from_state():
+    """Deleting a session removes it from the worktree's session list."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        wt = app._state.worktrees[0]
+        initial_count = len(wt.sessions)
+        assert initial_count >= 1
+
+        session = wt.sessions[-1]
+        app._active_session_name = session.tmux_session_name
+        app.post_message(SessionDeleted(wt, session))
+        await pilot.pause(delay=1.0)
+
+        assert len(wt.sessions) == initial_count - 1
+
+
+@pytest.mark.asyncio
+async def test_delete_active_session_clears_terminal():
+    """Deleting the active session sets terminal active_session to None."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        wt = app._state.worktrees[0]
+        session = wt.sessions[0]
+        app._active_worktree = wt
+        app._active_session_name = session.tmux_session_name
+
+        # Set terminal to show this session
+        wtc = app.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+        terminal = wtc.query_one(TerminalPane)
+        terminal.active_session = session.tmux_session_name
+        await pilot.pause()
+
+        app.post_message(SessionDeleted(wt, session))
+        await pilot.pause(delay=1.0)
+
+        assert terminal.active_session is None
+        assert app._active_session_name is None
