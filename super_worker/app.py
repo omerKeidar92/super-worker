@@ -282,6 +282,16 @@ class SuperWorkerApp(App):
         except Exception:
             pass
 
+        # Auto-select another session after deletion
+        if wt.sessions:
+            next_session = wt.sessions[0]
+            self._active_session_name = next_session.tmux_session_name
+            try:
+                wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+                wtc.query_one(TerminalPane).active_session = next_session.tmux_session_name
+            except Exception:
+                pass
+
         self.notify(f"Deleted session: {session.label}")
 
         # Kill tmux + save state in background (non-blocking via asyncio)
