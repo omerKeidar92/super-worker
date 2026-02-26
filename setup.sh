@@ -55,12 +55,30 @@ if ! command -v claude &>/dev/null; then
     echo
 fi
 
+# ── pipx ───────────────────────────────────────────────────────────────
+if ! command -v pipx &>/dev/null; then
+    warn "pipx not found — installing..."
+    if command -v brew &>/dev/null; then
+        brew install pipx
+    else
+        python3 -m pip install --user pipx
+    fi
+    pipx ensurepath 2>/dev/null || true
+    info "pipx installed"
+else
+    info "pipx"
+fi
+
 # ── Install super-worker ───────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo
-echo "Installing super-worker..."
-pip install -e "$SCRIPT_DIR" 2>&1 | tail -1
-info "super-worker installed"
+echo "Installing super-worker globally via pipx..."
+if pipx list 2>/dev/null | grep -q "super-worker"; then
+    pipx install -e "$SCRIPT_DIR" --force 2>&1 | tail -1
+else
+    pipx install -e "$SCRIPT_DIR" 2>&1 | tail -1
+fi
+info "super-worker installed (available globally as 'sw')"
 
 echo
-echo "Done! Run 'sw' to start."
+echo "Done! Run 'sw' from any terminal to start."
