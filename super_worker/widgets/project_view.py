@@ -413,6 +413,10 @@ class ProjectView(Widget):
             terminal.active_session = session_name
         except Exception:
             logger.debug("Failed to resume terminal after attach", exc_info=True)
+        # Refresh sidebar so session list and selection are restored after suspend
+        wt = self._active_worktree
+        if wt:
+            self.run_worker(lambda: self._refresh_sidebar(wt), exclusive=False)
 
     def do_open_terminal(self) -> None:
         if not self._active_session_name:
