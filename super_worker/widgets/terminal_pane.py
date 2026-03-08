@@ -5,11 +5,13 @@ from rich.text import Text
 from textual.events import Click, Key, Paste
 from textual.reactive import reactive
 from textual.app import ComposeResult
+from textual.containers import VerticalScroll
 from textual.widget import Widget
 from textual.widgets import Static
 from textual.worker import Worker, WorkerState
 
-from super_worker.constants import POLL_INTERVAL_MS, RESERVED_KEYS
+from super_worker.constants import PANE_FALLBACK_POLL_S, RESERVED_KEYS
+from super_worker.services.pane_watcher import PaneWatcher
 from super_worker.services.tmux import capture_pane, send_keys
 
 logger = logging.getLogger(__name__)
@@ -31,11 +33,16 @@ class TerminalPane(Widget, can_focus=True):
     TerminalPane {
         width: 1fr;
         height: 1fr;
-        overflow-y: auto;
         padding: 0 1;
+        layout: vertical;
     }
     TerminalPane:focus {
         border: tall $accent;
+    }
+    #terminal-scroll {
+        width: 1fr;
+        height: 1fr;
+        overflow-y: auto;
     }
     #terminal-content {
         width: 1fr;
@@ -46,15 +53,19 @@ class TerminalPane(Widget, can_focus=True):
     def __init__(self) -> None:
         super().__init__()
         self._last_hash: int = 0
-        self._timer = None
+        self._fallback_timer = None
+        self._watcher = PaneWatcher()
 
     def compose(self) -> ComposeResult:
-        yield Static("Select a session · Ctrl+A to attach", id="terminal-content")
+        with VerticalScroll(id="terminal-scroll"):
+            yield Static("Select a session · Ctrl+A to attach", id="terminal-content")
 
     def watch_active_session(self, old_value: str | None, session_name: str | None) -> None:
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer = None
+        if old_value:
+            self._watcher.stop_watching(old_value)
+        if self._fallback_timer is not None:
+            self._fallback_timer.stop()
+            self._fallback_timer = None
         self._last_hash = 0
         try:
             content = self.query_one("#terminal-content", Static)
@@ -65,8 +76,16 @@ class TerminalPane(Widget, can_focus=True):
         except Exception:
             logger.debug("terminal-content widget not available during session switch", exc_info=True)
         if session_name:
-            self._poll_pane()
-            self._timer = self.set_interval(POLL_INTERVAL_MS / 1000, self._poll_pane)
+            self._watcher.start_watching(session_name, self._on_pane_output)
+            self._poll_pane()  # Initial capture
+            self._fallback_timer = self.set_interval(PANE_FALLBACK_POLL_S, self._poll_pane)
+
+    def _on_pane_output(self) -> None:
+        """Called by PaneWatcher when pipe-pane file has new data."""
+        try:
+            self.app.call_later(self._poll_pane)
+        except Exception:
+            pass
 
     def _poll_pane(self) -> None:
         session = self.active_session
@@ -115,9 +134,10 @@ class TerminalPane(Widget, can_focus=True):
     }
 
     def on_unmount(self) -> None:
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer = None
+        if self._fallback_timer is not None:
+            self._fallback_timer.stop()
+            self._fallback_timer = None
+        self._watcher.cleanup()
 
     def _send_keys_async(self, *keys: str, literal: bool = False) -> None:
         """Send keys in a background thread to avoid blocking the event loop."""

@@ -63,6 +63,9 @@ class SessionSidebar(Vertical):
         height: 1fr;
         min-height: 4;
     }
+    #session-list > ListItem.--highlight {
+        background: $accent 30%;
+    }
     #git-status {
         height: auto;
         padding: 0 1;
@@ -123,7 +126,9 @@ class SessionSidebar(Vertical):
             return "[magenta]●[/]"
         if state == SessionState.WAITING_INPUT:
             return "[yellow]●[/]"
-        return "[green]●[/]"
+        if state == SessionState.RUNNING:
+            return "[green]●[/]"
+        return "[dim]●[/]"
 
     def show_worktree(
         self,
@@ -214,6 +219,16 @@ class SessionSidebar(Vertical):
         git_status = self.query_one("#git-status", Static)
         git_status.markup = True
         git_status.update("\n".join(parts))
+
+    def select_session(self, tmux_session_name: str) -> None:
+        """Programmatically highlight a session in the list by its tmux name."""
+        for idx, session in self._session_map.items():
+            if session.tmux_session_name == tmux_session_name:
+                try:
+                    self.query_one("#session-list", ListView).index = idx
+                except Exception:
+                    pass
+                return
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id != "session-list":

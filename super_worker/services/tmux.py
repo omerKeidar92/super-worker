@@ -57,6 +57,7 @@ class SessionState(Enum):
     RUNNING = "running"
     WAITING_INPUT = "waiting_input"
     WAITING_APPROVAL = "waiting_approval"
+    UNKNOWN = "unknown"
 
 
 _STATE_MAP = {
@@ -81,6 +82,15 @@ def _find_available_session_name(worktree: Worktree) -> str:
             return name
         index += 1
     raise RuntimeError(f"Could not find available session name for worktree '{worktree.name}'")
+
+
+def _set_session_env(session_name: str, key: str, value: str) -> None:
+    """Set a tmux environment variable on a session."""
+    try:
+        session = _get_server().sessions.get(session_name=session_name)
+        session.set_environment(key, value)
+    except Exception:
+        logger.debug("Failed to set env %s on session %s", key, session_name)
 
 
 def create_session(
@@ -114,6 +124,7 @@ def create_session(
         window_command=cmd,
     )
     tmux_session.set_option("mouse", "on")
+    tmux_session.set_option("remain-on-exit", "on")
 
     session = Session(
         tmux_session_name=sess_name,
@@ -147,16 +158,19 @@ def send_keys(tmux_session_name: str, *keys: str, literal: bool = False) -> None
     try:
         for key in keys:
             pane.send_keys(key, enter=False, literal=literal)
+        # Mark session as running when user sends input
+        _set_session_env(tmux_session_name, "SW_CC_STATE", "running")
     except Exception:
         invalidate_pane_cache(tmux_session_name)
         logger.debug("Failed to send keys to tmux session", extra={"session": tmux_session_name})
 
 
 def is_session_alive(tmux_session_name: str) -> bool:
-    """Check if a tmux session exists."""
+    """Check if a tmux session exists and its pane is alive."""
     try:
-        _get_server().sessions.get(session_name=tmux_session_name)
-        return True
+        session = _get_server().sessions.get(session_name=tmux_session_name)
+        pane = session.active_pane
+        return pane is not None and getattr(pane, "pane_dead", None) != "1"
     except Exception:
         return False
 
@@ -179,14 +193,37 @@ def batch_detect_session_states(session_names: list[str]) -> dict[str, SessionSt
             results[name] = SessionState.DEAD
             continue
 
+        session = live_sessions[name]
+
+        # Check if the pane is dead (remain-on-exit keeps session alive)
         try:
-            env = live_sessions[name].show_environment()
-            value = env.get("SW_CC_STATE", "")
-            results[name] = _STATE_MAP.get(value, SessionState.RUNNING)
+            pane = session.active_pane
+            if pane and getattr(pane, "pane_dead", None) == "1":
+                results[name] = SessionState.DEAD
+                continue
         except Exception:
-            results[name] = SessionState.RUNNING
+            pass
+
+        try:
+            env = session.show_environment()
+            value = env.get("SW_CC_STATE", "")
+            results[name] = _STATE_MAP.get(value, SessionState.UNKNOWN)
+        except Exception:
+            results[name] = SessionState.UNKNOWN
 
     return results
+
+
+def respawn_pane(tmux_session_name: str, cmd: str) -> bool:
+    """Respawn a dead pane with a new command. Returns True if successful."""
+    try:
+        server = _get_server()
+        server.cmd("respawn-pane", "-k", "-t", tmux_session_name, cmd)
+        invalidate_pane_cache(tmux_session_name)
+        return True
+    except Exception:
+        logger.debug("Failed to respawn pane for session %s", tmux_session_name)
+        return False
 
 
 def enable_mouse(tmux_session_name: str) -> None:

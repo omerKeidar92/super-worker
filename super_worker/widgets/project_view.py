@@ -160,7 +160,16 @@ class ProjectView(Widget):
 
     def on_mount(self) -> None:
         if self._state.worktrees:
-            self._set_active_worktree(self._state.worktrees[0])
+            wt = self._state.worktrees[0]
+            self._active_worktree = wt
+            if wt.sessions:
+                self._active_session_name = wt.sessions[0].tmux_session_name
+
+            async def _initial_refresh():
+                await self._refresh_sidebar(wt)
+                self._set_active_worktree(wt)
+
+            self.run_worker(_initial_refresh, exclusive=False)
 
     def _tab_label(self, wt: Worktree, git_data: tuple[dict, bool] | None = None) -> str:
         if git_data is None:
@@ -170,7 +179,7 @@ class ProjectView(Widget):
         attention = ""
         for s in wt.sessions:
             state = self._cached_session_states.get(s.tmux_session_name, SessionState.RUNNING)
-            if state in (SessionState.WAITING_INPUT, SessionState.WAITING_APPROVAL):
+            if state == SessionState.WAITING_APPROVAL:
                 attention = " 🔔"
                 break
         return f"{wt.name} (↑{status['ahead']} ↓{status['behind']}){dirty_marker}{attention}"
@@ -178,7 +187,15 @@ class ProjectView(Widget):
     def _set_active_worktree(self, wt: Worktree) -> None:
         self._active_worktree = wt
         if wt.sessions:
-            self._active_session_name = wt.sessions[0].tmux_session_name
+            first = wt.sessions[0]
+            self._active_session_name = first.tmux_session_name
+            try:
+                wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+                wtc.query_one(SessionSidebar).select_session(first.tmux_session_name)
+                terminal = wtc.query_one(TerminalPane)
+                terminal.active_session = first.tmux_session_name
+            except Exception:
+                pass
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         tab_id = event.pane.id
@@ -338,6 +355,7 @@ class ProjectView(Widget):
                 self._active_session_name = session.tmux_session_name
                 await self._refresh_sidebar(wt)
                 wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+                wtc.query_one(SessionSidebar).select_session(session.tmux_session_name)
                 terminal = wtc.query_one(TerminalPane)
                 terminal.active_session = session.tmux_session_name
                 terminal.focus()
