@@ -107,6 +107,7 @@ class TerminalPane(Widget, can_focus=True):
         self._last_hash = event.worker.result[0]
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
+            self.query_one("#terminal-scroll", VerticalScroll).scroll_end(animate=False)
         except Exception:
             logger.debug("terminal-content widget not available during pane update", exc_info=True)
 
@@ -140,18 +141,15 @@ class TerminalPane(Widget, can_focus=True):
         self._watcher.cleanup()
 
     def _send_keys_async(self, *keys: str, literal: bool = False) -> None:
-        """Send keys in a background thread to avoid blocking the event loop."""
+        """Send keys off the event loop. kqueue watcher handles rendering."""
         session = self.active_session
         if not session:
             return
-
-        def _send_and_capture():
-            send_keys(session, *keys, literal=literal)
-            # Trigger an immediate capture so the user sees their keystroke
-            # reflected without waiting for the next poll cycle.
-            return self._capture(session)
-
-        self.run_worker(_send_and_capture, thread=True, group="send-keys")
+        self.run_worker(
+            lambda: send_keys(session, *keys, literal=literal),
+            thread=True,
+            group="send-keys",
+        )
 
     def on_click(self, event: Click) -> None:
         """Consume clicks so the Static child doesn't trigger text selection."""
