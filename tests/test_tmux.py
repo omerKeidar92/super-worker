@@ -6,11 +6,14 @@ from super_worker.models import Session, Worktree
 from super_worker.services.tmux import (
     SessionState,
     _find_available_session_name,
+    _set_session_env,
     batch_detect_session_states,
     capture_pane,
     create_session,
+    is_session_alive,
     kill_session,
     kill_all_sessions,
+    respawn_pane,
     send_keys,
     tmux_session_name,
 )
@@ -60,11 +63,11 @@ class TestBatchDetectSessionStates:
         assert batch_detect_session_states([]) == {}
 
     @pytest.mark.parametrize("env,expected_state", [
-        ({}, SessionState.RUNNING),
+        ({}, SessionState.UNKNOWN),
         ({"SW_CC_STATE": "running"}, SessionState.RUNNING),
         ({"SW_CC_STATE": "waiting_input"}, SessionState.WAITING_INPUT),
         ({"SW_CC_STATE": "waiting_approval"}, SessionState.WAITING_APPROVAL),
-        ({"SW_CC_STATE": "unknown_value"}, SessionState.RUNNING),
+        ({"SW_CC_STATE": "unknown_value"}, SessionState.UNKNOWN),
     ])
     def test_alive_session_state(self, monkeypatch, env, expected_state):
         alive_session = MagicMock()
@@ -176,3 +179,90 @@ def test_kill_all_sessions(monkeypatch):
     kill_all_sessions(wt)
 
     assert killed == ["sw-feat-0", "sw-feat-1"]
+
+
+class TestSetSessionEnv:
+    def test_sets_env_var(self, monkeypatch):
+        mock_server, mock_session, _ = _mock_server(monkeypatch)
+        _set_session_env("sw-feat-0", "SW_CC_STATE", "running")
+        mock_session.set_environment.assert_called_once_with("SW_CC_STATE", "running")
+
+    def test_handles_missing_session(self, monkeypatch):
+        mock_server = MagicMock()
+        mock_server.sessions.get.side_effect = Exception("not found")
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+        _set_session_env("sw-dead-0", "SW_CC_STATE", "running")  # Should not raise
+
+
+class TestIsSessionAlive:
+    def test_alive_session(self, monkeypatch):
+        mock_pane = MagicMock()
+        mock_pane.pane_dead = "0"
+        _mock_server(monkeypatch, pane=mock_pane)
+        assert is_session_alive("sw-feat-0") is True
+
+    def test_dead_pane(self, monkeypatch):
+        mock_pane = MagicMock()
+        mock_pane.pane_dead = "1"
+        _mock_server(monkeypatch, pane=mock_pane)
+        assert is_session_alive("sw-feat-0") is False
+
+    def test_missing_session(self, monkeypatch):
+        mock_server = MagicMock()
+        mock_server.sessions.get.side_effect = Exception("not found")
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+        assert is_session_alive("sw-dead-0") is False
+
+
+class TestBatchDetectDeadPanes:
+    def test_dead_pane_returns_dead_state(self, monkeypatch):
+        """A session with remain-on-exit and a dead pane returns DEAD."""
+        alive_session = MagicMock()
+        alive_session.session_name = "sw-a-0"
+        dead_pane = MagicMock()
+        dead_pane.pane_dead = "1"
+        alive_session.active_pane = dead_pane
+
+        mock_server = MagicMock()
+        mock_server.sessions = [alive_session]
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+
+        result = batch_detect_session_states(["sw-a-0"])
+        assert result["sw-a-0"] == SessionState.DEAD
+
+
+class TestRespawnPane:
+    def test_respawn_calls_tmux_cmd(self, monkeypatch):
+        mock_server = MagicMock()
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+
+        result = respawn_pane("sw-feat-0", "claude --continue")
+
+        assert result is True
+        mock_server.cmd.assert_called_once_with(
+            "respawn-pane", "-k", "-t", "sw-feat-0", "claude --continue"
+        )
+
+    def test_respawn_handles_failure(self, monkeypatch):
+        mock_server = MagicMock()
+        mock_server.cmd.side_effect = Exception("failed")
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+
+        result = respawn_pane("sw-dead-0", "claude --continue")
+
+        assert result is False
+
+
+class TestCreateSessionRemainOnExit:
+    def test_sets_remain_on_exit(self, monkeypatch):
+        """create_session() enables remain-on-exit on the tmux session."""
+        mock_tmux_session = MagicMock()
+        mock_server = MagicMock()
+        mock_server.sessions = []
+        mock_server.new_session.return_value = mock_tmux_session
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+
+        wt = Worktree(name="feat", path="/tmp/feat", branch="main")
+        create_session(wt)
+
+        mock_tmux_session.set_option.assert_any_call("remain-on-exit", "on")

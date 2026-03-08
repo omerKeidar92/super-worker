@@ -162,7 +162,8 @@ class TestRecoverDeadSessions:
         assert recover_dead_sessions(state) is False
         assert state.worktrees[0].sessions[0].tmux_session_name == "sw-feat-0"
 
-    def test_dead_sessions_replaced_with_resumed(self, tmp_path, monkeypatch):
+    def test_dead_sessions_respawned_in_place(self, tmp_path, monkeypatch):
+        """Dead claude sessions with remain-on-exit are respawned in-place."""
         wt_path = tmp_path / "feat"
         wt_path.mkdir()
         s = Session(tmux_session_name="sw-feat-0", label="dead-one")
@@ -170,6 +171,23 @@ class TestRecoverDeadSessions:
         state = AppState(repo_root=str(tmp_path), worktree_base=str(tmp_path), worktrees=[wt])
 
         monkeypatch.setattr("super_worker.services.state.is_session_alive", lambda name: False)
+        monkeypatch.setattr("super_worker.services.state.respawn_pane", lambda name, cmd: True)
+
+        assert recover_dead_sessions(state) is True
+        # Original session preserved (respawned in-place)
+        assert state.worktrees[0].sessions[0].tmux_session_name == "sw-feat-0"
+        assert state.worktrees[0].sessions[0].label == "dead-one"
+
+    def test_dead_sessions_recreated_when_respawn_fails(self, tmp_path, monkeypatch):
+        """When respawn fails (session gone entirely), a new session is created."""
+        wt_path = tmp_path / "feat"
+        wt_path.mkdir()
+        s = Session(tmux_session_name="sw-feat-0", label="dead-one")
+        wt = Worktree(name="feat", path=str(wt_path), branch="sw-feat", sessions=[s])
+        state = AppState(repo_root=str(tmp_path), worktree_base=str(tmp_path), worktrees=[wt])
+
+        monkeypatch.setattr("super_worker.services.state.is_session_alive", lambda name: False)
+        monkeypatch.setattr("super_worker.services.state.respawn_pane", lambda name, cmd: False)
         created_kwargs = []
 
         def fake_create(worktree, **kwargs):
@@ -203,17 +221,14 @@ class TestRecoverDeadSessions:
             "super_worker.services.state.is_session_alive",
             lambda name: name == "sw-feat-0",
         )
-
-        def fake_create(worktree, **kwargs):
-            return Session(tmux_session_name="sw-feat-2", label=kwargs.get("label", "new"))
-
-        monkeypatch.setattr("super_worker.services.state.create_session", fake_create)
+        # Respawn succeeds — dead session kept in-place
+        monkeypatch.setattr("super_worker.services.state.respawn_pane", lambda name, cmd: True)
 
         assert recover_dead_sessions(state) is True
         sessions = state.worktrees[0].sessions
         assert len(sessions) == 2
         assert sessions[0].tmux_session_name == "sw-feat-0"
-        assert sessions[1].label == "(resumed)"
+        assert sessions[1].tmux_session_name == "sw-feat-1"
 
     def test_dead_terminal_sessions_dropped_without_resume(self, tmp_path, monkeypatch):
         """Dead terminal sessions are dropped — nothing to --continue."""
@@ -232,7 +247,7 @@ class TestRecoverDeadSessions:
         assert create_called == [], "create_session should not be called for dead terminal sessions"
 
     def test_mixed_dead_claude_and_terminal(self, tmp_path, monkeypatch):
-        """Dead claude sessions get resumed; dead terminal sessions are dropped."""
+        """Dead claude sessions get respawned; dead terminal sessions are dropped."""
         wt_path = tmp_path / "feat"
         wt_path.mkdir()
         alive_s = Session(tmux_session_name="sw-feat-0", label="alive")
@@ -245,14 +260,11 @@ class TestRecoverDeadSessions:
             "super_worker.services.state.is_session_alive",
             lambda name: name == "sw-feat-0",
         )
-
-        def fake_create(worktree, **kwargs):
-            return Session(tmux_session_name="sw-feat-3", label=kwargs.get("label", "new"))
-
-        monkeypatch.setattr("super_worker.services.state.create_session", fake_create)
+        # Respawn succeeds for dead claude session
+        monkeypatch.setattr("super_worker.services.state.respawn_pane", lambda name, cmd: True)
 
         assert recover_dead_sessions(state) is True
         sessions = state.worktrees[0].sessions
         assert len(sessions) == 2
         assert sessions[0].tmux_session_name == "sw-feat-0"  # alive kept
-        assert sessions[1].label == "(resumed)"  # dead claude resumed
+        assert sessions[1].tmux_session_name == "sw-feat-1"  # dead claude respawned

@@ -39,8 +39,8 @@ class TestBatchDetectSessionStatesIntegration:
     def test_detects_alive_session(self, real_tmux_session):
         """An alive session should be detected and state queried."""
         result = batch_detect_session_states([real_tmux_session.session_name])
-        # Session exists but no SW_CC_STATE, so should be RUNNING
-        assert result[real_tmux_session.session_name] == SessionState.RUNNING
+        # Session exists but no SW_CC_STATE, so defaults to UNKNOWN
+        assert result[real_tmux_session.session_name] == SessionState.UNKNOWN
 
     def test_detects_session_with_state(self, real_tmux_session):
         """A session with SW_CC_STATE env var should have its state detected."""
@@ -56,7 +56,7 @@ class TestBatchDetectSessionStatesIntegration:
             real_tmux_session.session_name,
             "nonexistent-session-xyz"
         ])
-        assert result[real_tmux_session.session_name] == SessionState.RUNNING
+        assert result[real_tmux_session.session_name] == SessionState.UNKNOWN
         assert result["nonexistent-session-xyz"] == SessionState.DEAD
 
 class TestCapturePaneIntegration:

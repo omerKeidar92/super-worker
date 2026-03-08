@@ -1,12 +1,14 @@
 import fcntl
 import json
 import logging
+import shlex
+import shutil
 from pathlib import Path
 
 from super_worker.config import ResolvedConfig, detect_repo_root
 from super_worker.constants import STATE_DIR
 from super_worker.models import AppState
-from super_worker.services.tmux import create_session, is_session_alive
+from super_worker.services.tmux import create_session, is_session_alive, respawn_pane, _get_server
 from super_worker.services.worktree import discover_worktrees, prune_git_cache
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,27 @@ def load_state(config: ResolvedConfig) -> AppState:
         fcntl.flock(lf, fcntl.LOCK_SH)
         try:
             data = json.loads(state_file.read_text())
+        except json.JSONDecodeError:
+            # Main file corrupted — try backup
+            bak = state_file.with_suffix(".bak")
+            if bak.exists():
+                logger.warning("State file corrupted, falling back to backup")
+                try:
+                    data = json.loads(bak.read_text())
+                except (json.JSONDecodeError, OSError):
+                    logger.warning("Backup also corrupted, starting fresh")
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+                    return AppState(
+                        repo_root=str(config.repo_root),
+                        worktree_base=str(config.base_dir),
+                    )
+            else:
+                logger.warning("State file corrupted and no backup, starting fresh")
+                fcntl.flock(lf, fcntl.LOCK_UN)
+                return AppState(
+                    repo_root=str(config.repo_root),
+                    worktree_base=str(config.base_dir),
+                )
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
@@ -69,6 +92,9 @@ def save_state(state: AppState, config: ResolvedConfig) -> None:
     with open(lock_file, "a") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
+            # Backup existing state file before overwriting
+            if state_file.exists():
+                shutil.copy2(state_file, state_file.with_suffix(".bak"))
             tmp.write_text(state.model_dump_json(indent=2))
             tmp.rename(state_file)
         finally:
@@ -88,11 +114,11 @@ def remove_session_from_state(state: AppState, worktree_name: str, session_id: s
 
 
 def recover_dead_sessions(state: AppState) -> bool:
-    """Recover dead sessions by recreating them with `claude --continue`.
+    """Recover dead sessions by respawning or recreating with `claude --continue`.
 
-    For each worktree that still exists on disk, any dead sessions are
-    replaced with a new tmux session using `--continue` to resume the
-    most recent CC conversation in that directory.
+    For claude sessions where the tmux session still exists (remain-on-exit),
+    respawn the pane in-place to preserve scrollback. Otherwise, create a new
+    session. Dead terminal sessions are dropped (nothing to resume).
 
     Returns True if any sessions were recovered.
     """
@@ -112,18 +138,44 @@ def recover_dead_sessions(state: AppState) -> bool:
                 dead_other.append(s)
         if not dead_claude and not dead_other:
             continue
+
         logger.info(
             "Recovering dead sessions in worktree",
             extra={"worktree": wt.name, "dead_claude": len(dead_claude), "dead_other": len(dead_other), "alive": len(alive)},
         )
+
         # Resume dead claude sessions; drop dead terminal sessions (nothing to resume)
         new_sessions = list(alive)
-        if dead_claude:
-            resumed = create_session(wt, label="(resumed)", skip_permissions=False, resume=True)
-            new_sessions.append(resumed)
+        for s in dead_claude:
+            # Try to respawn in-place (preserves scrollback from remain-on-exit)
+            resume_cmd = f"env SW_SESSION_NAME={shlex.quote(s.tmux_session_name)} TERM=xterm-256color claude --continue"
+            if respawn_pane(s.tmux_session_name, resume_cmd):
+                logger.info("Respawned dead pane in-place", extra={"session": s.tmux_session_name})
+                new_sessions.append(s)
+            else:
+                # Session gone entirely — create fresh with --continue
+                resumed = create_session(wt, label="(resumed)", skip_permissions=False, resume=True)
+                new_sessions.append(resumed)
         wt.sessions = new_sessions
         changed = True
     return changed
+
+
+def _ensure_remain_on_exit(state: AppState) -> None:
+    """Retroactively set remain-on-exit on all existing tmux sessions."""
+    try:
+        server = _get_server()
+        live = {s.session_name: s for s in server.sessions}
+    except Exception:
+        return
+    for wt in state.worktrees:
+        for s in wt.sessions:
+            tmux_sess = live.get(s.tmux_session_name)
+            if tmux_sess is not None:
+                try:
+                    tmux_sess.set_option("remain-on-exit", "on")
+                except Exception:
+                    pass
 
 
 def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bool:
@@ -138,6 +190,9 @@ def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bo
         valid_worktrees.append(wt)
     state.worktrees = valid_worktrees
     prune_git_cache({wt.path for wt in valid_worktrees})
+
+    # Ensure remain-on-exit is set on all existing sessions
+    _ensure_remain_on_exit(state)
 
     # Discover worktrees on disk that aren't in state
     if config is not None:

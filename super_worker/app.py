@@ -9,6 +9,7 @@ from textual.widgets import ContentSwitcher, Footer, Header, Static
 
 from super_worker.config import ResolvedConfig, load_config
 from super_worker.constants import SIDEBAR_REFRESH_S
+from super_worker.services.hooks import install_hooks
 from super_worker.services.state import (
     load_projects_registry,
     load_state,
@@ -64,10 +65,12 @@ class SuperWorkerApp(App):
         Binding("ctrl+shift+right", "next_project", "Next Project", key_display="ctrl+⇧▶"),
         Binding("ctrl+e", "edit_settings", "Settings"),
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("f12", "debug_screenshot", "Screenshot", show=False),
     ]
 
     def __init__(self) -> None:
         super().__init__()
+        install_hooks()
         self._active_project_view: ProjectView | None = None
         self._open_configs: list[ResolvedConfig] = []
         self._initial_project: tuple[ResolvedConfig, object] | None = None
@@ -93,7 +96,8 @@ class SuperWorkerApp(App):
         with Horizontal(id="main-area"):
             # Overlay mode: left-side drawer, hidden by default (Ctrl+O to toggle).
             yield ProjectDrawer(id="project-drawer")
-            with ContentSwitcher(id="project-switcher"):
+            initial_id = f"pv-{self._initial_project[0].state_hash}" if self._initial_project else None
+            with ContentSwitcher(id="project-switcher", initial=initial_id):
                 if self._initial_project:
                     config, state = self._initial_project
                     yield ProjectView(config, state, id=f"pv-{config.state_hash}")
@@ -146,12 +150,7 @@ class SuperWorkerApp(App):
             pass
 
     def action_toggle_project_drawer(self) -> None:
-        tab_bar = self.query_one(ProjectTabBar)
-        if tab_bar.has_class("-visible"):
-            # Already docked — Ctrl+O re-opens the floating drawer on top
-            self.query_one(ProjectDrawer).open()
-        else:
-            self.query_one(ProjectDrawer).toggle()
+        self.query_one(ProjectDrawer).toggle()
 
     def on_dock_toggled(self, event: DockToggled) -> None:
         """Switch between overlay drawer and docked tab bar."""
@@ -279,6 +278,17 @@ class SuperWorkerApp(App):
     def action_delete_worktree(self) -> None:
         if pv := self._active_project_view:
             pv.do_delete_worktree()
+
+    def action_debug_screenshot(self) -> None:
+        """Save an SVG screenshot for debugging (F12)."""
+        import time
+        out = Path("/private/tmp/sw-pilot-screenshots")
+        out.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        path = out / f"screenshot_{ts}.svg"
+        svg = self.export_screenshot(title=f"sw-{ts}")
+        path.write_text(svg)
+        self.notify(f"Screenshot: {path.name}")
 
     def action_prev_project(self) -> None:
         self._cycle_project(-1)
