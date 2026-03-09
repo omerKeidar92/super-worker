@@ -35,7 +35,6 @@ from super_worker.services.tmux import (
     SessionState,
     batch_detect_session_states,
     create_session,
-    detect_session_state,
     enable_mouse,
     kill_all_sessions,
     kill_session,
@@ -173,16 +172,16 @@ class ProjectView(Widget):
             self.run_worker(_initial_refresh, exclusive=False)
 
     def _tab_label(self, wt: Worktree, git_data: tuple[dict, bool] | None = None) -> str:
-        if git_data is None:
-            return wt.name
-        status, dirty = git_data
-        dirty_marker = " *" if dirty else ""
         attention = ""
         for s in wt.sessions:
             state = self._cached_session_states.get(s.tmux_session_name, SessionState.RUNNING)
             if state == SessionState.WAITING_APPROVAL:
                 attention = " 🔔"
                 break
+        if git_data is None:
+            return f"{wt.name}{attention}"
+        status, dirty = git_data
+        dirty_marker = " *" if dirty else ""
         return f"{wt.name} (↑{status['ahead']} ↓{status['behind']}){dirty_marker}{attention}"
 
     def _update_app_subtitle(self, session_label: str | None = None) -> None:
@@ -219,22 +218,21 @@ class ProjectView(Widget):
                 self._set_active_worktree(wt)
 
     def on_terminal_pane_content_changed(self, event: TerminalPane.ContentChanged) -> None:
-        """Pane output changed — check active session state so indicators update instantly."""
-        name = self._active_session_name
-        if not name:
-            return
-        self.run_worker(self._check_active_state(name), exclusive=False)
+        """Pane output changed — check all session states so indicators update fast."""
+        all_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
+        if all_names:
+            self.run_worker(self._check_all_states(all_names), exclusive=False)
 
-    async def _check_active_state(self, session_name: str) -> None:
-        """Check single session state in background thread; update UI only on change."""
-        state = await asyncio.to_thread(detect_session_state, session_name)
-        prev = self._cached_session_states.get(session_name)
-        if state == prev:
+    async def _check_all_states(self, session_names: list[str]) -> None:
+        """Check all session states in background thread; update UI only on change."""
+        states = await asyncio.to_thread(batch_detect_session_states, session_names)
+        if states == {k: self._cached_session_states.get(k) for k in states}:
             return
-        self._cached_session_states[session_name] = state
+        self._cached_session_states.update(states)
+        for wt in self._state.worktrees:
+            self._refresh_tab_label(wt, git_data=None)
         wt = self._active_worktree
         if wt:
-            self._refresh_tab_label(wt, git_data=None)
             try:
                 wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
                 sidebar = wtc.query_one(SessionSidebar)
