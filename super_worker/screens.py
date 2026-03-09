@@ -241,8 +241,8 @@ class RenameSessionScreen(_ModalNavMixin, ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class ConfirmDeleteScreen(_ModalNavMixin, ModalScreen[bool]):
-    """Confirmation dialog for deleting a worktree."""
+class ConfirmDeleteScreen(_ModalNavMixin, ModalScreen[tuple[bool, bool] | None]):
+    """Confirmation dialog for deleting a worktree with options."""
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -255,8 +255,8 @@ class ConfirmDeleteScreen(_ModalNavMixin, ModalScreen[bool]):
         align: center middle;
     }
     #confirm-dialog {
-        width: 50;
-        height: 10;
+        width: 55;
+        height: auto;
         border: thick $error;
         background: $surface;
         padding: 1 2;
@@ -270,26 +270,37 @@ class ConfirmDeleteScreen(_ModalNavMixin, ModalScreen[bool]):
     }
     """
 
-    def __init__(self, worktree_name: str) -> None:
+    def __init__(self, worktree_name: str, branch: str) -> None:
         super().__init__()
         self._worktree_name = worktree_name
+        self._branch = branch
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
             yield Label(f"Delete worktree '{self._worktree_name}'?")
-            yield Label("This will kill all sessions and remove the\nworktree directory. Branch is kept.")
+            yield Label("This will kill all sessions and remove the worktree.")
+            yield ModalCheckbox("Also delete branch", id="del-branch")
+            yield ModalCheckbox("Also delete worktree files", id="del-files", value=True)
             with Horizontal(id="confirm-buttons"):
                 yield Button("Delete", variant="error", id="btn-confirm")
                 yield Button("Cancel", variant="default", id="btn-cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "btn-confirm")
+        if event.button.id == "btn-confirm":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def _submit(self) -> None:
+        delete_branch = self.query_one("#del-branch", Checkbox).value
+        delete_files = self.query_one("#del-files", Checkbox).value
+        self.dismiss((delete_branch, delete_files))
 
     def action_confirm(self) -> None:
-        self.dismiss(True)
+        self._submit()
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        self.dismiss(None)
 
 
 class CommitMessageScreen(_ModalNavMixin, ModalScreen[str | None]):

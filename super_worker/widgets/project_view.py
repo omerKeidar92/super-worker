@@ -521,9 +521,10 @@ class ProjectView(Widget):
 
         wt_name = wt.name
 
-        def handle_confirm(confirmed: bool) -> None:
-            if not confirmed:
+        def handle_confirm(result: tuple[bool, bool] | None) -> None:
+            if result is None:
                 return
+            del_branch, del_files = result
 
             async def _delete() -> None:
                 target = self._state.get_worktree(wt_name)
@@ -531,7 +532,10 @@ class ProjectView(Widget):
                     return
                 try:
                     await asyncio.to_thread(kill_all_sessions, target)
-                    await asyncio.to_thread(remove_worktree, self._state, wt_name, force=True)
+                    await asyncio.to_thread(
+                        remove_worktree, self._state, wt_name,
+                        force=True, delete_branch=del_branch, delete_files=del_files,
+                    )
                     self._state = remove_worktree_from_state(self._state, wt_name)
                     await asyncio.to_thread(save_state, self._state, self._config)
                 except Exception as e:
@@ -545,7 +549,7 @@ class ProjectView(Widget):
 
             self.run_worker(_delete, exclusive=False)
 
-        self.app.push_screen(ConfirmDeleteScreen(wt.name), callback=handle_confirm)
+        self.app.push_screen(ConfirmDeleteScreen(wt.name, wt.branch), callback=handle_confirm)
 
     async def _remove_worktree_tab(self, name: str) -> None:
         try:
