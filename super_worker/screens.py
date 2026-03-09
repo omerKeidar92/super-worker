@@ -72,7 +72,7 @@ class _ModalNavMixin:
         self.focus_previous()
 
 
-class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str | None, bool, bool] | None]):
+class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str | None, bool, bool, bool] | None]):
     """Modal dialog for creating a new worktree."""
 
     BINDINGS = [
@@ -95,9 +95,10 @@ class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str |
     }
     """
 
-    def __init__(self, config: ResolvedConfig) -> None:
+    def __init__(self, config: ResolvedConfig, branches: list[str] | None = None) -> None:
         super().__init__()
         self._config = config
+        self._branches = branches or []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="new-wt-dialog"):
@@ -108,12 +109,19 @@ class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str |
             yield Input(placeholder=self._config.branch_placeholder, id="wt-branch")
             yield Label("Initial prompt (optional, e.g. /plan):")
             yield Input(placeholder="/plan", id="wt-prompt")
+            yield ModalCheckbox("Use existing branch", id="wt-use-existing")
             yield ModalCheckbox("No new branch (detached HEAD)", id="wt-detach")
             yield ModalCheckbox("Skip permissions", id="wt-skip-perms")
             yield Label("Press Enter to create, Escape to cancel")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.action_submit()
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id == "wt-use-existing" and event.value:
+            self.query_one("#wt-detach", Checkbox).value = False
+        elif event.checkbox.id == "wt-detach" and event.value:
+            self.query_one("#wt-use-existing", Checkbox).value = False
 
     def action_submit(self) -> None:
         name = self.query_one("#wt-name", Input).value.strip()
@@ -124,9 +132,13 @@ class NewWorktreeScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str |
             return
         branch = self.query_one("#wt-branch", Input).value.strip() or None
         prompt = self.query_one("#wt-prompt", Input).value.strip() or None
+        use_existing = self.query_one("#wt-use-existing", Checkbox).value
         detach = self.query_one("#wt-detach", Checkbox).value
         skip_perms = self.query_one("#wt-skip-perms", Checkbox).value
-        self.dismiss((name, branch, prompt, detach, skip_perms))
+        if use_existing and not branch:
+            self.notify("Branch name is required when using an existing branch", severity="error")
+            return
+        self.dismiss((name, branch, prompt, detach, skip_perms, use_existing))
 
     def action_cancel(self) -> None:
         self.dismiss(None)

@@ -47,6 +47,7 @@ from super_worker.services.worktree import (
     get_current_branch,
     get_worktree_dirty,
     invalidate_git_cache,
+    list_local_branches,
     remove_worktree,
 )
 from super_worker.widgets.sidebar import GitAction, SessionDeleted, SessionSelected, SessionSidebar
@@ -325,16 +326,18 @@ class ProjectView(Widget):
     # ── Public delegation API ─────────────────────────────────────────────────
 
     def do_new_worktree(self) -> None:
-        def handle_result(result: tuple[str, str | None, str | None, bool, bool] | None) -> None:
+        branches = list_local_branches(self._config.repo_root)
+
+        def handle_result(result: tuple[str, str | None, str | None, bool, bool, bool] | None) -> None:
             if result is None:
                 return
-            name, branch, prompt, detach, skip_perms = result
+            name, branch, prompt, detach, skip_perms, use_existing = result
             if self._state.get_worktree(name):
                 self.app.notify(f"Worktree '{name}' already exists", severity="error")
                 return
-            self._create_worktree(name, prompt, branch=branch, use_existing_branch=False, detach=detach, skip_permissions=skip_perms)
+            self._create_worktree(name, prompt, branch=branch, use_existing_branch=use_existing, detach=detach, skip_permissions=skip_perms)
 
-        self.app.push_screen(NewWorktreeScreen(self._config), callback=handle_result)
+        self.app.push_screen(NewWorktreeScreen(self._config, branches=branches), callback=handle_result)
 
     def _create_worktree(
         self,
