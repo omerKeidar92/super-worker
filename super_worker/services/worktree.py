@@ -199,17 +199,11 @@ def remove_worktree(
             # force=True: git failed, clean up directory manually
             if wt_path.exists():
                 shutil.rmtree(wt_path)
-    else:
-        # Just unregister the worktree without deleting files
+
         try:
-            git_repo.git.worktree("remove", "--force", str(wt_path))
+            git_repo.git.worktree("prune")
         except gitpython.GitCommandError:
             pass
-
-    try:
-        git_repo.git.worktree("prune")
-    except gitpython.GitCommandError:
-        pass
 
     if delete_branch and branch and branch != "(detached)":
         try:
