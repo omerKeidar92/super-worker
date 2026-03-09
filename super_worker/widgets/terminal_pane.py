@@ -109,10 +109,10 @@ class TerminalPane(Widget, can_focus=True):
             return
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
-            self.query_one("#terminal-scroll", VerticalScroll).scroll_end(animate=False)
-            # Only update hash after successful content update so retries
-            # keep working if the widget isn't available yet.
+            # Update hash right after content renders so duplicate captures
+            # are skipped; scroll_end failure must not prevent this.
             self._last_hash = event.worker.result[0]
+            self.query_one("#terminal-scroll", VerticalScroll).scroll_end(animate=False)
         except Exception:
             logger.debug("terminal-content widget not available during pane update", exc_info=True)
 
