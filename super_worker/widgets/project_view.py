@@ -534,6 +534,7 @@ class ProjectView(Widget):
                     await asyncio.to_thread(
                         remove_worktree, self._state, wt_name,
                         force=True, delete_branch=del_branch,
+                        remote=self._config.remote,
                     )
                     self._state = remove_worktree_from_state(self._state, wt_name)
                     await asyncio.to_thread(save_state, self._state, self._config)

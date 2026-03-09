@@ -169,8 +169,9 @@ def remove_worktree(
     name: str,
     force: bool = False,
     delete_branch: bool = False,
+    remote: str = "",
 ) -> None:
-    """Remove a git worktree and its directory, optionally deleting the local branch."""
+    """Remove a git worktree and its directory, optionally deleting the branch (local + remote)."""
     wt = state.get_worktree(name)
     if not wt:
         raise ValueError(f"Worktree not found: {name}")
@@ -207,7 +208,13 @@ def remove_worktree(
         try:
             git_repo.git.branch("-D", branch)
         except gitpython.GitCommandError:
-            logger.debug("Failed to delete branch %s", branch)
+            logger.debug("Failed to delete local branch %s", branch)
+        # Also delete the remote branch
+        if remote:
+            try:
+                git_repo.git.push(remote, "--delete", branch)
+            except gitpython.GitCommandError:
+                logger.debug("Failed to delete remote branch %s/%s", remote, branch)
 
 
 def get_current_branch(repo_path: str) -> str:

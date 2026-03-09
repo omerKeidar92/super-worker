@@ -279,7 +279,7 @@ class ConfirmDeleteScreen(_ModalNavMixin, ModalScreen[bool | None]):
         with Vertical(id="confirm-dialog"):
             yield Label(f"Delete worktree '{self._worktree_name}'?")
             yield Label("This will kill all sessions and remove the\nworktree directory.")
-            yield ModalCheckbox("Also delete local branch", id="del-branch")
+            yield ModalCheckbox("Also delete branch (local + remote)", id="del-branch")
             with Horizontal(id="confirm-buttons"):
                 yield Button("Delete", variant="error", id="btn-confirm")
                 yield Button("Cancel", variant="default", id="btn-cancel")
