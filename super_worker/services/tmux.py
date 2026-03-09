@@ -142,7 +142,7 @@ def capture_pane(tmux_session_name: str) -> str:
     if pane is None:
         return f"[Session {tmux_session_name} not found]"
     try:
-        lines = pane.capture_pane(start=-500, escape_sequences=True)
+        lines = pane.capture_pane(start=-100, escape_sequences=True)
         return "\n".join(lines)
     except Exception:
         invalidate_pane_cache(tmux_session_name)
