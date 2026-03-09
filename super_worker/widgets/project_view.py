@@ -217,6 +217,36 @@ class ProjectView(Widget):
             if wt:
                 self._set_active_worktree(wt)
 
+    _last_state_check: float = 0.0
+    _STATE_CHECK_THROTTLE_S = 1.0
+
+    def on_terminal_pane_content_changed(self, event: TerminalPane.ContentChanged) -> None:
+        """Pane output changed — check session states so indicators update fast."""
+        import time
+        now = time.monotonic()
+        if now - self._last_state_check < self._STATE_CHECK_THROTTLE_S:
+            return
+        self._last_state_check = now
+        wt = self._active_worktree
+        if wt and wt.sessions:
+            self.run_worker(self._quick_state_refresh(wt), exclusive=False)
+
+    async def _quick_state_refresh(self, wt: Worktree) -> None:
+        """Lightweight state-only check (no git status)."""
+        session_names = [s.tmux_session_name for s in wt.sessions]
+        states = await asyncio.to_thread(batch_detect_session_states, session_names) if session_names else {}
+        new_states = {k: v for k, v in states.items()}
+        if new_states == {k: self._cached_session_states.get(k) for k in new_states}:
+            return  # No change
+        self._cached_session_states.update(new_states)
+        self._refresh_tab_label(wt, git_data=None)
+        try:
+            wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+            sidebar = wtc.query_one(SessionSidebar)
+            sidebar.show_worktree(wt, states=states)
+        except Exception:
+            pass
+
     def on_session_selected(self, event: SessionSelected) -> None:
         self._active_worktree = event.worktree
         self._active_session_name = event.session.tmux_session_name

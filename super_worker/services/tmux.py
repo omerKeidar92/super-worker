@@ -142,11 +142,15 @@ def capture_pane(tmux_session_name: str) -> str:
     if pane is None:
         return f"[Session {tmux_session_name} not found]"
     try:
-        lines = pane.capture_pane(start=-100, escape_sequences=True)
+        lines = pane.capture_pane(start=-500, escape_sequences=True)
         return "\n".join(lines)
     except Exception:
         invalidate_pane_cache(tmux_session_name)
         return f"[Session {tmux_session_name} not found]"
+
+
+_last_state_set: dict[str, float] = {}
+_STATE_SET_THROTTLE_S = 1.0
 
 
 def send_keys(tmux_session_name: str, *keys: str, literal: bool = False) -> None:
@@ -158,8 +162,11 @@ def send_keys(tmux_session_name: str, *keys: str, literal: bool = False) -> None
     try:
         for key in keys:
             pane.send_keys(key, enter=False, literal=literal)
-        # Mark session as running when user sends input
-        _set_session_env(tmux_session_name, "SW_CC_STATE", "running")
+        # Mark session as running (throttled to avoid 6ms overhead per keystroke)
+        now = time.monotonic()
+        if now - _last_state_set.get(tmux_session_name, 0) >= _STATE_SET_THROTTLE_S:
+            _set_session_env(tmux_session_name, "SW_CC_STATE", "running")
+            _last_state_set[tmux_session_name] = now
     except Exception:
         invalidate_pane_cache(tmux_session_name)
         logger.debug("Failed to send keys to tmux session", extra={"session": tmux_session_name})
