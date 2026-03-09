@@ -18,6 +18,7 @@ from super_worker.services.worktree import (
     get_current_branch,
     get_worktree_dirty,
     invalidate_git_cache,
+    list_local_branches,
     prune_git_cache,
     remove_worktree,
 )
@@ -381,6 +382,36 @@ class TestRemoveWorktree:
 
         # Should not raise — errors are logged and swallowed
         remove_worktree(state, "feat", force=True, delete_branch=True, remote="origin")
+
+
+class TestListLocalBranches:
+    def test_returns_sorted_branch_names(self, monkeypatch):
+        mock_repo = MagicMock()
+        mock_head_main = MagicMock()
+        mock_head_main.name = "main"
+        mock_head_feat = MagicMock()
+        mock_head_feat.name = "feat-xyz"
+        mock_head_alpha = MagicMock()
+        mock_head_alpha.name = "alpha"
+        mock_repo.heads = [mock_head_main, mock_head_feat, mock_head_alpha]
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        result = list_local_branches(Path("/tmp/repo"))
+        assert result == ["alpha", "feat-xyz", "main"]
+
+    def test_returns_empty_on_error(self, monkeypatch):
+        monkeypatch.setattr(
+            gitpython, "Repo",
+            MagicMock(side_effect=gitpython.InvalidGitRepositoryError("bad")),
+        )
+        assert list_local_branches(Path("/tmp/bad")) == []
+
+    def test_returns_empty_for_no_branches(self, monkeypatch):
+        mock_repo = MagicMock()
+        mock_repo.heads = []
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        assert list_local_branches(Path("/tmp/repo")) == []
 
 
 class TestDiscoverWorktrees:
