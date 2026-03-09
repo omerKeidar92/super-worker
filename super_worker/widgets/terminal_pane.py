@@ -115,7 +115,6 @@ class TerminalPane(Widget, can_focus=True):
         self._last_hash = event.worker.result[0]
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
-            self.query_one("#terminal-scroll", VerticalScroll).scroll_end(animate=False)
             self.post_message(self.ContentChanged())
         except Exception:
             logger.debug("terminal-content widget not available during pane update", exc_info=True)
