@@ -184,6 +184,17 @@ class ProjectView(Widget):
                 break
         return f"{wt.name} (↑{status['ahead']} ↓{status['behind']}){dirty_marker}{attention}"
 
+    def _update_app_subtitle(self, session_label: str | None = None) -> None:
+        """Update the app subtitle to include the active session label."""
+        try:
+            base = str(self._config.repo_root)
+            if session_label:
+                self.app.sub_title = f"{base} · {session_label}"
+            else:
+                self.app.sub_title = base
+        except Exception:
+            pass
+
     def _set_active_worktree(self, wt: Worktree) -> None:
         self._active_worktree = wt
         if wt.sessions:
@@ -196,6 +207,7 @@ class ProjectView(Widget):
                 terminal.active_session = first.tmux_session_name
             except Exception:
                 pass
+            self._update_app_subtitle(first.label)
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         tab_id = event.pane.id
@@ -215,6 +227,7 @@ class ProjectView(Widget):
             terminal.focus()
         except Exception:
             logger.debug("Failed to activate session in terminal pane", exc_info=True)
+        self._update_app_subtitle(event.session.label)
 
     async def on_session_deleted(self, event: SessionDeleted) -> None:
         wt = event.worktree
@@ -248,6 +261,9 @@ class ProjectView(Widget):
                 wtc.query_one(TerminalPane).active_session = next_session.tmux_session_name
             except Exception:
                 pass
+            self._update_app_subtitle(next_session.label)
+        else:
+            self._update_app_subtitle()
 
         self.app.notify(f"Deleted session: {session.label}")
         await asyncio.to_thread(kill_session, tmux_name)
@@ -416,7 +432,7 @@ class ProjectView(Widget):
         # Refresh sidebar so session list and selection are restored after suspend
         wt = self._active_worktree
         if wt:
-            self.run_worker(lambda: self._refresh_sidebar(wt), exclusive=False)
+            self.run_worker(self._refresh_sidebar(wt), exclusive=False)
 
     def do_open_terminal(self) -> None:
         if not self._active_session_name:
