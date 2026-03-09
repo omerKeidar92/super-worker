@@ -169,9 +169,8 @@ def remove_worktree(
     name: str,
     force: bool = False,
     delete_branch: bool = False,
-    delete_files: bool = True,
 ) -> None:
-    """Remove a git worktree, optionally deleting the branch and files."""
+    """Remove a git worktree and its directory, optionally deleting the local branch."""
     wt = state.get_worktree(name)
     if not wt:
         raise ValueError(f"Worktree not found: {name}")
@@ -181,29 +180,28 @@ def remove_worktree(
     git_repo = gitpython.Repo(repo)
     branch = wt.branch
 
-    if delete_files:
-        try:
-            args = ["remove"]
-            if force:
-                args.append("--force")
-            args.append(str(wt_path))
-            git_repo.git.worktree(*args)
-        except gitpython.GitCommandError as e:
-            stderr = str(e.stderr or e)
-            if not force and "contains modified or untracked files" in stderr:
-                raise RuntimeError(
-                    f"Worktree has uncommitted changes. Use --force to remove anyway.\n{stderr}"
-                ) from e
-            if not force:
-                raise RuntimeError(f"Failed to remove worktree: {stderr}") from e
-            # force=True: git failed, clean up directory manually
-            if wt_path.exists():
-                shutil.rmtree(wt_path)
+    try:
+        args = ["remove"]
+        if force:
+            args.append("--force")
+        args.append(str(wt_path))
+        git_repo.git.worktree(*args)
+    except gitpython.GitCommandError as e:
+        stderr = str(e.stderr or e)
+        if not force and "contains modified or untracked files" in stderr:
+            raise RuntimeError(
+                f"Worktree has uncommitted changes. Use --force to remove anyway.\n{stderr}"
+            ) from e
+        if not force:
+            raise RuntimeError(f"Failed to remove worktree: {stderr}") from e
+        # force=True: git failed, clean up directory manually
+        if wt_path.exists():
+            shutil.rmtree(wt_path)
 
-        try:
-            git_repo.git.worktree("prune")
-        except gitpython.GitCommandError:
-            pass
+    try:
+        git_repo.git.worktree("prune")
+    except gitpython.GitCommandError:
+        pass
 
     if delete_branch and branch and branch != "(detached)":
         try:
