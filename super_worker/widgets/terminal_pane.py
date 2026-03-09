@@ -58,7 +58,10 @@ class TerminalPane(Widget, can_focus=True):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="terminal-scroll"):
-            yield Static("Select a session · Ctrl+A to attach", id="terminal-content")
+            content = Static("Select a session · Ctrl+A to attach", id="terminal-content")
+            content.auto_links = False
+            content.ALLOW_SELECT = False
+            yield content
 
     def watch_active_session(self, old_value: str | None, session_name: str | None) -> None:
         if old_value:
@@ -104,10 +107,12 @@ class TerminalPane(Widget, can_focus=True):
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.state != WorkerState.SUCCESS or event.worker.result is None:
             return
-        self._last_hash = event.worker.result[0]
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
             self.query_one("#terminal-scroll", VerticalScroll).scroll_end(animate=False)
+            # Only update hash after successful content update so retries
+            # keep working if the widget isn't available yet.
+            self._last_hash = event.worker.result[0]
         except Exception:
             logger.debug("terminal-content widget not available during pane update", exc_info=True)
 
