@@ -2,13 +2,8 @@
 
 import asyncio
 import logging
-import platform
 import shlex
-import shutil
 import subprocess
-import webbrowser
-
-import git as gitpython
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.message import Message
@@ -28,6 +23,7 @@ from super_worker.screens import (
     RenameSessionScreen,
 )
 from super_worker.services.state import (
+    ensure_default_worktree,
     remove_session_from_state,
     remove_worktree_from_state,
     save_state,
@@ -37,15 +33,20 @@ from super_worker.services.tmux import (
     batch_detect_session_states,
     create_session,
     enable_mouse,
+    has_waiting_approval,
     kill_all_sessions,
     kill_session,
+    open_external_terminal,
 )
 from super_worker.services.worktree import (
     BranchExistsError,
     create_worktree,
     get_branch_status,
-    get_current_branch,
     get_worktree_dirty,
+    git_commit,
+    git_create_pr,
+    git_pull,
+    git_push,
     invalidate_git_cache,
     list_local_branches,
     remove_worktree,
@@ -143,20 +144,12 @@ class ProjectView(Widget):
         return self._state
 
     def _ensure_default_worktree(self) -> None:
-        existing = self._state.get_worktree(DEFAULT_WORKTREE_NAME)
-        if existing:
-            existing.branch = get_current_branch(str(self._config.repo_root))
-            if not existing.sessions:
-                session = create_session(existing)
-                existing.sessions.append(session)
-                save_state(self._state, self._config)
-            return
-
-        branch = get_current_branch(str(self._config.repo_root))
-        wt = Worktree(name=DEFAULT_WORKTREE_NAME, path=str(self._config.repo_root), branch=branch)
-        session = create_session(wt)
-        wt.sessions.append(session)
-        self._state.worktrees.insert(0, wt)
+        ensure_default_worktree(self._state, self._config)
+        # TUI mode also needs at least one tmux session per worktree
+        wt = self._state.get_worktree(DEFAULT_WORKTREE_NAME)
+        if wt and not wt.sessions:
+            session = create_session(wt)
+            wt.sessions.append(session)
         save_state(self._state, self._config)
 
     def compose(self) -> ComposeResult:
@@ -182,12 +175,8 @@ class ProjectView(Widget):
             self.run_worker(_initial_refresh, exclusive=False)
 
     def _tab_label(self, wt: Worktree, git_data: tuple[dict, bool] | None = None) -> str:
-        attention = ""
-        for s in wt.sessions:
-            state = self._cached_session_states.get(s.tmux_session_name, SessionState.RUNNING)
-            if state == SessionState.WAITING_APPROVAL:
-                attention = " 🔔"
-                break
+        wt_states = {s.tmux_session_name: self._cached_session_states.get(s.tmux_session_name, SessionState.RUNNING) for s in wt.sessions}
+        attention = " 🔔" if has_waiting_approval(wt_states) else ""
         if git_data is None:
             return f"{wt.name}{attention}"
         status, dirty = git_data
@@ -238,13 +227,9 @@ class ProjectView(Widget):
         states = await asyncio.to_thread(batch_detect_session_states, session_names)
         if states == {k: self._cached_session_states.get(k) for k in states}:
             return
-        old_attention = any(
-            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
-        )
+        old_attention = has_waiting_approval(self._cached_session_states)
         self._cached_session_states.update(states)
-        new_attention = any(
-            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
-        )
+        new_attention = has_waiting_approval(self._cached_session_states)
         if old_attention != new_attention:
             self.post_message(self.AttentionChanged(
                 str(self._config.repo_root), new_attention
@@ -487,18 +472,8 @@ class ProjectView(Widget):
 
         async def _open() -> None:
             await asyncio.to_thread(enable_mouse, session_name)
-            attach_cmd = f"tmux attach-session -t {shlex.quote(session_name)}"
-            system = platform.system()
-            if system == "Darwin":
-                subprocess.Popen([
-                    "osascript", "-e",
-                    f'tell application "Terminal" to do script "{attach_cmd}"',
-                ])
-            else:
-                for term in ("x-terminal-emulator", "gnome-terminal", "xterm"):
-                    if shutil.which(term):
-                        subprocess.Popen([term, "-e", "bash", "-c", attach_cmd])
-                        return
+            opened = await asyncio.to_thread(open_external_terminal, session_name)
+            if not opened:
                 self.app.notify("No terminal emulator found. Use Ctrl+A to attach.", severity="warning")
 
         self.run_worker(_open, exclusive=False)
@@ -577,17 +552,13 @@ class ProjectView(Widget):
 
     async def check_attention(self) -> None:
         """Lightweight state-only check for non-active projects."""
-        old_attention = any(
-            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
-        )
+        old_attention = has_waiting_approval(self._cached_session_states)
         all_session_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
         if all_session_names:
             self._cached_session_states = await asyncio.to_thread(batch_detect_session_states, all_session_names)
         else:
             self._cached_session_states = {}
-        new_attention = any(
-            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
-        )
+        new_attention = has_waiting_approval(self._cached_session_states)
         if old_attention != new_attention:
             self.post_message(self.AttentionChanged(
                 str(self._config.repo_root), new_attention
@@ -595,17 +566,13 @@ class ProjectView(Widget):
 
     async def periodic_refresh(self) -> None:
         """Fetch all blocking data in threads, then update UI. Called by app timer."""
-        old_attention = any(
-            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
-        )
+        old_attention = has_waiting_approval(self._cached_session_states)
         all_session_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
         if all_session_names:
             self._cached_session_states = await asyncio.to_thread(batch_detect_session_states, all_session_names)
         else:
             self._cached_session_states = {}
-        new_attention = any(
-            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
-        )
+        new_attention = has_waiting_approval(self._cached_session_states)
         if old_attention != new_attention:
             self.post_message(self.AttentionChanged(
                 str(self._config.repo_root), new_attention
@@ -676,47 +643,33 @@ class ProjectView(Widget):
 
     def _git_push(self, wt: Worktree) -> None:
         async def _push() -> None:
-            try:
-                repo = gitpython.Repo(wt.path)
-                await asyncio.to_thread(repo.git.push, "-u", self._config.remote, wt.branch)
+            err = await asyncio.to_thread(git_push, wt.path, self._config.remote, wt.branch)
+            if err:
+                self.app.notify(f"Push failed: {err[:100]}", severity="error")
+            else:
                 self.app.notify(f"Pushed to {self._config.remote}")
-            except gitpython.GitCommandError as e:
-                self.app.notify(f"Push failed: {str(e.stderr or e)[:100]}", severity="error")
             await self._refresh_git_ui(wt)
 
         self.run_worker(_push, exclusive=False)
 
     def _git_pull(self, wt: Worktree) -> None:
         async def _pull() -> None:
-            try:
-                repo = gitpython.Repo(wt.path)
-                await asyncio.to_thread(repo.git.pull, self._config.remote, self._config.main_branch)
+            err = await asyncio.to_thread(git_pull, wt.path, self._config.remote, self._config.main_branch)
+            if err:
+                self.app.notify(f"Pull failed: {err[:100]}", severity="error")
+            else:
                 self.app.notify(f"Pulled latest from {self._config.main_branch}")
-            except gitpython.GitCommandError as e:
-                self.app.notify(f"Pull failed: {str(e.stderr or e)[:100]}", severity="error")
             await self._refresh_git_ui(wt)
 
         self.run_worker(_pull, exclusive=False)
 
     def _git_create_pr(self, wt: Worktree) -> None:
         async def _pr() -> None:
-            result = await asyncio.to_thread(
-                subprocess.run, ["gh", "auth", "status"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode != 0:
-                self.app.notify("gh CLI not installed or not authenticated. Run: gh auth login", severity="error")
-                return
-            result = await asyncio.to_thread(
-                subprocess.run, ["gh", "pr", "create", "--fill", "--head", wt.branch],
-                cwd=wt.path, capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode == 0:
-                url = result.stdout.strip()
-                webbrowser.open(url)
-                self.app.notify(f"PR created: {url}")
+            ok, result = await asyncio.to_thread(git_create_pr, wt.path, wt.branch)
+            if ok:
+                self.app.notify(f"PR created: {result}")
             else:
-                self.app.notify(f"PR failed: {(result.stderr or '')[:100]}", severity="error")
+                self.app.notify(f"PR failed: {result[:100]}", severity="error")
 
         self.run_worker(_pr, exclusive=False)
 
@@ -726,13 +679,11 @@ class ProjectView(Widget):
                 return
 
             async def _commit() -> None:
-                try:
-                    repo = gitpython.Repo(wt.path)
-                    await asyncio.to_thread(repo.git.add, "-u")
-                    await asyncio.to_thread(repo.git.commit, "-m", msg)
+                err = await asyncio.to_thread(git_commit, wt.path, msg)
+                if err:
+                    self.app.notify(f"Commit failed: {err[:100]}", severity="error")
+                else:
                     self.app.notify("Committed")
-                except gitpython.GitCommandError as e:
-                    self.app.notify(f"Commit failed: {str(e.stderr or e)[:100]}", severity="error")
                 await self._refresh_git_ui(wt)
 
             self.run_worker(_commit, exclusive=False)

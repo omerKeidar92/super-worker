@@ -1,21 +1,33 @@
 import fcntl
 import json
 import logging
-import shlex
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 from super_worker.config import ResolvedConfig, detect_repo_root
 from super_worker.constants import STATE_DIR
 from super_worker.models import AppState
-from super_worker.services.tmux import create_session, is_session_alive, respawn_pane, _get_server
-from super_worker.services.worktree import discover_worktrees, prune_git_cache
+from super_worker.services.tmux import build_process_cmd, build_session_env_cmd, create_session, is_session_alive, respawn_pane, _get_server
+from super_worker.services.worktree import discover_worktrees, get_current_branch, prune_git_cache
 
 logger = logging.getLogger(__name__)
 
 
 def _ensure_state_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def _file_lock(path: Path, exclusive: bool = True):
+    """Acquire a file lock (shared or exclusive) with automatic cleanup."""
+    lock_file = path.with_suffix(".lock")
+    with open(lock_file, "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def _state_file_for(config: ResolvedConfig) -> Path:
@@ -51,9 +63,7 @@ def load_state(config: ResolvedConfig) -> AppState:
             repo_root=str(config.repo_root),
             worktree_base=str(config.base_dir),
         )
-    lock_file = state_file.with_suffix(".lock")
-    with open(lock_file, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_SH)
+    with _file_lock(state_file, exclusive=False):
         try:
             data = json.loads(state_file.read_text())
         except json.JSONDecodeError:
@@ -65,20 +75,16 @@ def load_state(config: ResolvedConfig) -> AppState:
                     data = json.loads(bak.read_text())
                 except (json.JSONDecodeError, OSError):
                     logger.warning("Backup also corrupted, starting fresh")
-                    fcntl.flock(lf, fcntl.LOCK_UN)
                     return AppState(
                         repo_root=str(config.repo_root),
                         worktree_base=str(config.base_dir),
                     )
             else:
                 logger.warning("State file corrupted and no backup, starting fresh")
-                fcntl.flock(lf, fcntl.LOCK_UN)
                 return AppState(
                     repo_root=str(config.repo_root),
                     worktree_base=str(config.base_dir),
                 )
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
 
     data = _migrate_data(data)
     return AppState.model_validate(data)
@@ -87,18 +93,13 @@ def load_state(config: ResolvedConfig) -> AppState:
 def save_state(state: AppState, config: ResolvedConfig) -> None:
     _ensure_state_dir()
     state_file = _state_file_for(config)
-    lock_file = state_file.with_suffix(".lock")
     tmp = state_file.with_suffix(".tmp")
-    with open(lock_file, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            # Backup existing state file before overwriting
-            if state_file.exists():
-                shutil.copy2(state_file, state_file.with_suffix(".bak"))
-            tmp.write_text(state.model_dump_json(indent=2))
-            tmp.rename(state_file)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    with _file_lock(state_file):
+        # Backup existing state file before overwriting
+        if state_file.exists():
+            shutil.copy2(state_file, state_file.with_suffix(".bak"))
+        tmp.write_text(state.model_dump_json(indent=2))
+        tmp.rename(state_file)
 
 
 def remove_worktree_from_state(state: AppState, name: str) -> AppState:
@@ -122,6 +123,9 @@ def recover_dead_sessions(state: AppState) -> bool:
 
     Returns True if any sessions were recovered.
     """
+    if state.ui_mode == "fast":
+        # Fast mode: panes are ephemeral. Dead panes are cleaned up on next launch.
+        return False
     changed = False
     for wt in state.worktrees:
         if not Path(wt.path).exists():
@@ -148,7 +152,12 @@ def recover_dead_sessions(state: AppState) -> bool:
         new_sessions = list(alive)
         for s in dead_claude:
             # Try to respawn in-place (preserves scrollback from remain-on-exit)
-            resume_cmd = f"env SW_SESSION_NAME={shlex.quote(s.tmux_session_name)} TERM=xterm-256color claude --continue"
+            process_cmd = build_process_cmd(
+                session_type=s.session_type,
+                skip_permissions=s.skip_permissions,
+                resume=True,
+            )
+            resume_cmd = build_session_env_cmd(s.tmux_session_name, process_cmd)
             if respawn_pane(s.tmux_session_name, resume_cmd):
                 logger.info("Respawned dead pane in-place", extra={"session": s.tmux_session_name})
                 new_sessions.append(s)
@@ -176,6 +185,26 @@ def _ensure_remain_on_exit(state: AppState) -> None:
                     tmux_sess.set_option("remain-on-exit", "on")
                 except Exception:
                     pass
+
+
+def ensure_default_worktree(state: AppState, config: ResolvedConfig) -> bool:
+    """Ensure the 'main' worktree exists, pointing at the repo root.
+
+    Returns True if a new worktree was created (i.e. state changed).
+    Both TUI and fast mode call this; callers can add sessions afterward.
+    """
+    from super_worker.constants import DEFAULT_WORKTREE_NAME
+    from super_worker.models import Worktree
+
+    existing = state.get_worktree(DEFAULT_WORKTREE_NAME)
+    if existing:
+        existing.branch = get_current_branch(str(config.repo_root))
+        return False
+
+    branch = get_current_branch(str(config.repo_root))
+    wt = Worktree(name=DEFAULT_WORKTREE_NAME, path=str(config.repo_root), branch=branch)
+    state.worktrees.insert(0, wt)
+    return True
 
 
 def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bool:
@@ -206,6 +235,17 @@ def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bo
     return changed
 
 
+def _load_registry_json() -> list[str]:
+    """Load projects.json with error handling. Returns empty list on any failure."""
+    registry_path = STATE_DIR / "projects.json"
+    if not registry_path.exists():
+        return []
+    try:
+        return json.loads(registry_path.read_text())
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _normalize_registry(projects: list[str]) -> list[str]:
     """Resolve any worktree paths to their main repo root and deduplicate."""
     seen: list[str] = []
@@ -226,52 +266,39 @@ def update_projects_registry(config: ResolvedConfig) -> None:
     """Track this repo in the global projects registry."""
     _ensure_state_dir()
     registry_path = STATE_DIR / "projects.json"
-    lock_file = registry_path.with_suffix(".lock")
-    with open(lock_file, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            projects: list[str] = []
-            if registry_path.exists():
-                try:
-                    projects = json.loads(registry_path.read_text())
-                except (json.JSONDecodeError, TypeError):
-                    projects = []
-            # Normalize: resolve worktrees → main repo, drop missing paths.
-            projects = _normalize_registry(projects)
-            repo_str = str(config.repo_root)
-            if repo_str not in projects:
-                projects.append(repo_str)
-            registry_path.write_text(json.dumps(projects, indent=2))
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    with _file_lock(registry_path):
+        projects = _load_registry_json()
+        # Normalize: resolve worktrees → main repo, drop missing paths.
+        projects = _normalize_registry(projects)
+        repo_str = str(config.repo_root)
+        if repo_str not in projects:
+            projects.append(repo_str)
+        registry_path.write_text(json.dumps(projects, indent=2))
 
 
 def remove_from_projects_registry(path: str) -> None:
     """Remove a repo path from the global projects registry."""
     _ensure_state_dir()
     registry_path = STATE_DIR / "projects.json"
-    lock_file = registry_path.with_suffix(".lock")
-    with open(lock_file, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            projects: list[str] = []
-            if registry_path.exists():
-                try:
-                    projects = json.loads(registry_path.read_text())
-                except (json.JSONDecodeError, TypeError):
-                    projects = []
-            projects = [p for p in projects if p != path]
-            registry_path.write_text(json.dumps(projects, indent=2))
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    with _file_lock(registry_path):
+        projects = [p for p in _load_registry_json() if p != path]
+        registry_path.write_text(json.dumps(projects, indent=2))
 
 
 def load_projects_registry() -> list[str]:
     """Load list of known repo paths."""
-    registry_path = STATE_DIR / "projects.json"
-    if not registry_path.exists():
-        return []
-    try:
-        return json.loads(registry_path.read_text())
-    except (json.JSONDecodeError, TypeError):
-        return []
+    return _load_registry_json()
+
+
+def load_and_reconcile(config: ResolvedConfig) -> AppState:
+    """Load state, register project, reconcile worktrees, recover dead sessions.
+
+    Saves state if any changes were made. Used by both TUI and fast mode startup.
+    """
+    state = load_state(config)
+    update_projects_registry(config)
+    changed = reconcile_state(state, config)
+    changed = recover_dead_sessions(state) or changed
+    if changed:
+        save_state(state, config)
+    return state

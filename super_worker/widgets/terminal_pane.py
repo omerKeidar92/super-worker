@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 
 from rich.text import Text
 from textual.events import Click, Key, Paste
@@ -19,6 +20,15 @@ logger = logging.getLogger(__name__)
 
 # Strip ANSI background color sequences to avoid theme bleed
 _BG_ANSI_RE = re.compile(r"\x1b\[(?:4[0-9]|10[0-7]|48;[0-9;]*)m")
+
+# Sentinel that never equals any real hash — avoids the hash("") == 0 bug
+_NO_HASH = object()
+
+# If no successful render for this long, force a re-capture (empty screen recovery)
+_FORCE_REFRESH_S = 3.0
+
+# Debounce kqueue-triggered renders to coalesce rapid updates during typing
+_RENDER_DEBOUNCE_S = 0.05
 
 
 class TerminalPane(Widget, can_focus=True):
@@ -57,8 +67,10 @@ class TerminalPane(Widget, can_focus=True):
 
     def __init__(self) -> None:
         super().__init__()
-        self._last_hash: int = 0
+        self._last_hash: int | object = _NO_HASH
         self._fallback_timer = None
+        self._render_timer = None
+        self._last_successful_render: float = 0.0
         self._watcher = PaneWatcher()
 
     def compose(self) -> ComposeResult:
@@ -74,16 +86,21 @@ class TerminalPane(Widget, can_focus=True):
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        self._last_hash = 0
-        try:
-            content = self.query_one("#terminal-content", Static)
-            if session_name:
-                content.update("")
-            else:
-                content.update("Select a session · Ctrl+A to attach")
-        except Exception:
-            logger.debug("terminal-content widget not available during session switch", exc_info=True)
+        if self._render_timer is not None:
+            self._render_timer.stop()
+            self._render_timer = None
+        self._last_hash = _NO_HASH
+        self._last_successful_render = 0.0
+        if not session_name:
+            try:
+                self.query_one("#terminal-content", Static).update(
+                    "Select a session · Ctrl+A to attach"
+                )
+            except Exception:
+                logger.debug("terminal-content widget not available during session switch", exc_info=True)
         if session_name:
+            # Don't blank the screen — keep stale content visible until the
+            # first capture arrives, avoiding the black-screen flash.
             self._watcher.start_watching(session_name, self._on_pane_output)
             self._poll_pane()  # Initial capture
             self._fallback_timer = self.set_interval(PANE_FALLBACK_POLL_S, self._poll_pane)
@@ -91,14 +108,31 @@ class TerminalPane(Widget, can_focus=True):
     def _on_pane_output(self) -> None:
         """Called by PaneWatcher when pipe-pane file has new data."""
         try:
-            self.app.call_later(self._poll_pane)
+            # Debounce: coalesce rapid kqueue events (e.g. during typing) into
+            # a single capture+render.  Without this, every keystroke triggers a
+            # full 500-line ANSI parse + widget re-layout.
+            if self._render_timer is not None:
+                self._render_timer.stop()
+            self._render_timer = self.set_timer(
+                _RENDER_DEBOUNCE_S, self._debounced_poll
+            )
         except Exception:
             pass
+
+    def _debounced_poll(self) -> None:
+        """Fires after the render debounce window closes."""
+        self._render_timer = None
+        self._poll_pane()
 
     def _poll_pane(self) -> None:
         session = self.active_session
         if not session:
             return
+        # Empty screen recovery: if no successful render recently, reset hash
+        # so the next capture is guaranteed to produce a widget update.
+        now = time.monotonic()
+        if (now - self._last_successful_render) > _FORCE_REFRESH_S:
+            self._last_hash = _NO_HASH
         self.run_worker(lambda: self._capture(session), thread=True, exclusive=True)
 
     def _capture(self, session_name: str) -> tuple[int, Text] | None:
@@ -113,6 +147,7 @@ class TerminalPane(Widget, can_focus=True):
         if event.state != WorkerState.SUCCESS or event.worker.result is None:
             return
         self._last_hash = event.worker.result[0]
+        self._last_successful_render = time.monotonic()
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
             self.post_message(self.ContentChanged())
@@ -146,6 +181,9 @@ class TerminalPane(Widget, can_focus=True):
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
+        if self._render_timer is not None:
+            self._render_timer.stop()
+            self._render_timer = None
         self._watcher.cleanup()
 
     def _send_keys_async(self, *keys: str, literal: bool = False) -> None:

@@ -4,6 +4,7 @@ from textual.containers import Vertical
 from textual.message import Message
 from textual.widgets import Button, Label, ListItem, ListView, Static
 
+from super_worker.constants import get_session_type_tag
 from super_worker.models import Session, Worktree
 from super_worker.services.tmux import SessionState, batch_detect_session_states
 from super_worker.services.worktree import get_branch_status, get_worktree_dirty
@@ -173,7 +174,7 @@ class SessionSidebar(Vertical):
         for i, s in enumerate(worktree.sessions):
             state = states.get(s.tmux_session_name, SessionState.RUNNING)
             dot = self._state_dot(state)
-            tag = "[dim]sh[/]" if s.session_type == "terminal" else "[dim]CC[/]"
+            tag = f"[dim]{get_session_type_tag(s.session_type)}[/]"
             label_text = f"{dot} {tag} {s.label}"
             self._session_map[i] = s
 

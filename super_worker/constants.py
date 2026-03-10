@@ -11,3 +11,16 @@ SIDEBAR_REFRESH_S = 5
 DEFAULT_WORKTREE_NAME = "main"
 
 RESERVED_KEYS = {"ctrl+n", "ctrl+s", "ctrl+a", "ctrl+t", "ctrl+r", "ctrl+d", "ctrl+e", "ctrl+q", "ctrl+o", "ctrl+shift+left", "ctrl+shift+right", "tab"}
+
+FAST_SESSION_PREFIX = "sw-fast"
+FAST_STATUS_INTERVAL = 2  # seconds between tmux status bar refreshes
+
+
+def get_session_type_tag(session_type: str) -> str:
+    """Return short tag for a session type: 'sh' for terminal, 'CC' for claude."""
+    return "sh" if session_type == "terminal" else "CC"
+
+
+def format_pane_title(label: str, session_type: str) -> str:
+    """Format a pane title like '● label [CC]'."""
+    return f"\u25cf {label} [{get_session_type_tag(session_type)}]"

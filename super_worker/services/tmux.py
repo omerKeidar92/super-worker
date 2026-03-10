@@ -1,6 +1,8 @@
 import logging
 import os
+import platform
 import shlex
+import shutil
 import subprocess
 import time
 from enum import Enum
@@ -94,6 +96,35 @@ def _set_session_env(session_name: str, key: str, value: str) -> None:
         logger.debug("Failed to set env %s on session %s", key, session_name)
 
 
+def build_process_cmd(
+    session_type: str = "claude",
+    skip_permissions: bool = False,
+    prompt: str | None = None,
+    resume: bool = False,
+) -> str:
+    """Build the process command (claude or shell) without env wrapper.
+
+    Shared by both TUI mode (create_session) and fast mode (build_pane_cmd).
+    """
+    if session_type == "terminal":
+        shell = os.environ.get("SHELL", "/bin/bash")
+        return shlex.quote(shell)
+    base = "claude --dangerously-skip-permissions" if skip_permissions else "claude"
+    if resume:
+        base = f"{base} --continue"
+    elif prompt:
+        base = f"{base} {shlex.quote(prompt)}"
+    return base
+
+
+def build_session_env_cmd(session_name: str, process_cmd: str) -> str:
+    """Wrap a process command with TUI-mode env vars.
+
+    Shared by create_session() and recover_dead_sessions().
+    """
+    return f"env SW_SESSION_NAME={shlex.quote(session_name)} TERM=xterm-256color {process_cmd}"
+
+
 def create_session(
     worktree: Worktree,
     prompt: str | None = None,
@@ -108,16 +139,11 @@ def create_session(
 
     if session_type == "terminal":
         session_label = label or "terminal"
-        shell = os.environ.get("SHELL", "/bin/bash")
-        cmd = f"env SW_SESSION_NAME={shlex.quote(sess_name)} TERM=xterm-256color {shlex.quote(shell)}"
     else:
         session_label = label or prompt or f"session {len(worktree.sessions)}"
-        base = "claude --dangerously-skip-permissions" if skip_permissions else "claude"
-        if resume:
-            base = f"{base} --continue"
-        elif prompt:
-            base = f"{base} {shlex.quote(prompt)}"
-        cmd = f"env SW_SESSION_NAME={shlex.quote(sess_name)} TERM=xterm-256color {base}"
+
+    process_cmd = build_process_cmd(session_type, skip_permissions, prompt, resume)
+    cmd = build_session_env_cmd(sess_name, process_cmd)
 
     tmux_session = server.new_session(
         session_name=sess_name,
@@ -247,6 +273,11 @@ def batch_detect_session_states(session_names: list[str]) -> dict[str, SessionSt
     return results
 
 
+def has_waiting_approval(states: dict[str, SessionState]) -> bool:
+    """Check if any session state is WAITING_APPROVAL."""
+    return any(v == SessionState.WAITING_APPROVAL for v in states.values())
+
+
 def respawn_pane(tmux_session_name: str, cmd: str) -> bool:
     """Respawn a dead pane with a new command. Returns True if successful."""
     try:
@@ -282,3 +313,24 @@ def kill_all_sessions(worktree: Worktree) -> None:
     """Kill all tmux sessions for a worktree."""
     for session in worktree.sessions:
         kill_session(session.tmux_session_name)
+
+
+def open_external_terminal(tmux_session_name: str) -> bool:
+    """Open a new terminal emulator window attached to a tmux session.
+
+    Returns True if a terminal was launched, False if no emulator was found.
+    """
+    attach_cmd = f"tmux attach-session -t {shlex.quote(tmux_session_name)}"
+    system = platform.system()
+    if system == "Darwin":
+        subprocess.Popen([
+            "osascript", "-e",
+            f'tell application "Terminal" to do script "{attach_cmd}"',
+        ])
+        return True
+    else:
+        for term in ("x-terminal-emulator", "gnome-terminal", "xterm"):
+            if shutil.which(term):
+                subprocess.Popen([term, "-e", "bash", "-c", attach_cmd])
+                return True
+    return False

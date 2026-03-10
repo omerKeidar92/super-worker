@@ -9,6 +9,7 @@ class Session(BaseModel):
 
     id: str = Field(default_factory=lambda: uuid4().hex[:8])
     tmux_session_name: str
+    tmux_pane_id: str | None = None  # e.g., "%5" — set in fast mode only
     label: str
     session_type: str = Field(default="claude")
     initial_prompt: str | None = None
@@ -32,9 +33,18 @@ class AppState(BaseModel):
     repo_root: str
     worktree_base: str
     worktrees: list[Worktree] = Field(default_factory=list)
+    ui_mode: str = "tui"  # "tui" or "fast"
 
     def get_worktree(self, name: str) -> Worktree | None:
         for wt in self.worktrees:
             if wt.name == name:
                 return wt
+        return None
+
+    def find_session_by_pane_id(self, pane_id: str) -> tuple["Worktree", "Session"] | None:
+        """Find a session across all worktrees by its tmux pane ID."""
+        for wt in self.worktrees:
+            for s in wt.sessions:
+                if s.tmux_pane_id == pane_id:
+                    return wt, s
         return None
