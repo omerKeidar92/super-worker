@@ -302,6 +302,86 @@ class TestRemoveWorktree:
         remove_worktree(state, "feat", force=True)
         mock_repo.git.worktree.assert_any_call("remove", "--force", str(wt_path))
 
+    def test_delete_branch_deletes_local_and_remote(self, tmp_path, monkeypatch):
+        wt_path = tmp_path / "wt"
+        wt_path.mkdir()
+        state = AppState(
+            repo_root=str(tmp_path),
+            worktree_base=str(tmp_path),
+            worktrees=[Worktree(name="feat", path=str(wt_path), branch="sw-feat")],
+        )
+        mock_repo = MagicMock()
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        remove_worktree(state, "feat", force=True, delete_branch=True, remote="origin")
+
+        mock_repo.git.branch.assert_called_once_with("-D", "sw-feat")
+        mock_repo.git.push.assert_called_once_with("origin", "--delete", "sw-feat")
+
+    def test_delete_branch_without_remote_skips_push(self, tmp_path, monkeypatch):
+        wt_path = tmp_path / "wt"
+        wt_path.mkdir()
+        state = AppState(
+            repo_root=str(tmp_path),
+            worktree_base=str(tmp_path),
+            worktrees=[Worktree(name="feat", path=str(wt_path), branch="sw-feat")],
+        )
+        mock_repo = MagicMock()
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        remove_worktree(state, "feat", force=True, delete_branch=True)
+
+        mock_repo.git.branch.assert_called_once_with("-D", "sw-feat")
+        mock_repo.git.push.assert_not_called()
+
+    def test_delete_branch_false_keeps_branch(self, tmp_path, monkeypatch):
+        wt_path = tmp_path / "wt"
+        wt_path.mkdir()
+        state = AppState(
+            repo_root=str(tmp_path),
+            worktree_base=str(tmp_path),
+            worktrees=[Worktree(name="feat", path=str(wt_path), branch="sw-feat")],
+        )
+        mock_repo = MagicMock()
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        remove_worktree(state, "feat", force=True, delete_branch=False, remote="origin")
+
+        mock_repo.git.branch.assert_not_called()
+        mock_repo.git.push.assert_not_called()
+
+    def test_delete_branch_skips_detached(self, tmp_path, monkeypatch):
+        wt_path = tmp_path / "wt"
+        wt_path.mkdir()
+        state = AppState(
+            repo_root=str(tmp_path),
+            worktree_base=str(tmp_path),
+            worktrees=[Worktree(name="feat", path=str(wt_path), branch="(detached)")],
+        )
+        mock_repo = MagicMock()
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        remove_worktree(state, "feat", force=True, delete_branch=True, remote="origin")
+
+        mock_repo.git.branch.assert_not_called()
+        mock_repo.git.push.assert_not_called()
+
+    def test_delete_branch_handles_git_errors(self, tmp_path, monkeypatch):
+        wt_path = tmp_path / "wt"
+        wt_path.mkdir()
+        state = AppState(
+            repo_root=str(tmp_path),
+            worktree_base=str(tmp_path),
+            worktrees=[Worktree(name="feat", path=str(wt_path), branch="sw-feat")],
+        )
+        mock_repo = MagicMock()
+        mock_repo.git.branch.side_effect = gitpython.GitCommandError("branch", 1)
+        mock_repo.git.push.side_effect = gitpython.GitCommandError("push", 1)
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+
+        # Should not raise — errors are logged and swallowed
+        remove_worktree(state, "feat", force=True, delete_branch=True, remote="origin")
+
 
 class TestDiscoverWorktrees:
     def _make_config(self, tmp_path):

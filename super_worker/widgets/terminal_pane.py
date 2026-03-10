@@ -112,9 +112,9 @@ class TerminalPane(Widget, can_focus=True):
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.state != WorkerState.SUCCESS or event.worker.result is None:
             return
+        self._last_hash = event.worker.result[0]
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
-            self._last_hash = event.worker.result[0]
             self.post_message(self.ContentChanged())
         except Exception:
             logger.debug("terminal-content widget not available during pane update", exc_info=True)
