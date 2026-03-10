@@ -62,7 +62,7 @@ class _ProjectTab(Horizontal):
     Horizontal container so name + × sit side-by-side at height:1.
     """
 
-    def __init__(self, name: str, path: str, active: bool = False, loaded: bool = False) -> None:
+    def __init__(self, name: str, path: str, active: bool = False, loaded: bool = False, attention: bool = False) -> None:
         classes = "proj-tab"
         if active:
             classes += " -active"
@@ -70,7 +70,7 @@ class _ProjectTab(Horizontal):
             classes += " -unloaded"
         super().__init__(classes=classes)
         self._project_path = path
-        self._tab_name = name
+        self._tab_name = f"{name} 🔔" if attention else name
 
     def compose(self) -> ComposeResult:
         yield Static(self._tab_name, classes="tab-name")
@@ -166,6 +166,7 @@ class ProjectTabBar(Widget):
         self._all_projects: list[str] = []
         self._open_paths: set[str] = set()
         self._current: str | None = None
+        self._attention_paths: set[str] = set()
 
     def compose(self) -> ComposeResult:
         # Project tabs are mounted dynamically before #tab-open-btn.
@@ -193,10 +194,12 @@ class ProjectTabBar(Widget):
         all_projects: list[str],
         open_paths: set[str],
         current: str | None,
+        attention_paths: set[str] | None = None,
     ) -> None:
         self._all_projects = all_projects
         self._open_paths = open_paths
         self._current = current
+        self._attention_paths = attention_paths or set()
         if self.has_class("-visible"):
             self._rebuild_tabs()
 
@@ -216,6 +219,7 @@ class ProjectTabBar(Widget):
                 path,
                 active=path == self._current,
                 loaded=path in self._open_paths,
+                attention=path in self._attention_paths,
             )
             for path in self._all_projects
         ]
@@ -321,6 +325,7 @@ class ProjectDrawer(Widget):
         self._projects: list[str] = []
         self._current: str | None = None
         self._open_paths: set[str] = set()
+        self._attention_paths: set[str] = set()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="drawer-header"):
@@ -342,10 +347,12 @@ class ProjectDrawer(Widget):
         projects: list[str],
         current: str | None,
         open_paths: set[str],
+        attention_paths: set[str] | None = None,
     ) -> None:
         self._projects = projects
         self._current = current
         self._open_paths = open_paths
+        self._attention_paths = attention_paths or set()
         self.call_after_refresh(self._rebuild_list)
 
     def _rebuild_list(self) -> None:
@@ -366,7 +373,8 @@ class ProjectDrawer(Widget):
             else:
                 marker = "  "
 
-            label = Label(f"{marker}{name}", classes="proj-item-label")
+            attention = " 🔔" if path in self._attention_paths else ""
+            label = Label(f"{marker}{name}{attention}", classes="proj-item-label")
             label.markup = True
             item = ListItem(label)
             item._project_path = path  # type: ignore[attr-defined]

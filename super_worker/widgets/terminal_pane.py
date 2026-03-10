@@ -3,6 +3,7 @@ import re
 
 from rich.text import Text
 from textual.events import Click, Key, Paste
+from textual.message import Message
 from textual.reactive import reactive
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
@@ -26,6 +27,10 @@ class TerminalPane(Widget, can_focus=True):
     This is a preview — for full interaction (cursor, scrolling, CC UI),
     press Ctrl+A to attach directly to the tmux session.
     """
+
+    class ContentChanged(Message):
+        """Posted when captured pane content has changed."""
+        pass
 
     active_session: reactive[str | None] = reactive(None)
 
@@ -109,10 +114,8 @@ class TerminalPane(Widget, can_focus=True):
             return
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
-            self.query_one("#terminal-scroll", VerticalScroll).scroll_end(animate=False)
-            # Only update hash after successful content update so retries
-            # keep working if the widget isn't available yet.
             self._last_hash = event.worker.result[0]
+            self.post_message(self.ContentChanged())
         except Exception:
             logger.debug("terminal-content widget not available during pane update", exc_info=True)
 

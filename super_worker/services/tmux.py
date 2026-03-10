@@ -1,6 +1,7 @@
 import logging
 import os
 import shlex
+import subprocess
 import time
 from enum import Enum
 
@@ -149,6 +150,10 @@ def capture_pane(tmux_session_name: str) -> str:
         return f"[Session {tmux_session_name} not found]"
 
 
+_last_state_set: dict[str, float] = {}
+_STATE_SET_THROTTLE_S = 1.0
+
+
 def send_keys(tmux_session_name: str, *keys: str, literal: bool = False) -> None:
     """Send keystrokes to a tmux session."""
     pane = _get_pane(tmux_session_name)
@@ -158,8 +163,11 @@ def send_keys(tmux_session_name: str, *keys: str, literal: bool = False) -> None
     try:
         for key in keys:
             pane.send_keys(key, enter=False, literal=literal)
-        # Mark session as running when user sends input
-        _set_session_env(tmux_session_name, "SW_CC_STATE", "running")
+        # Mark session as running (throttled to avoid 6ms overhead per keystroke)
+        now = time.monotonic()
+        if now - _last_state_set.get(tmux_session_name, 0) >= _STATE_SET_THROTTLE_S:
+            _set_session_env(tmux_session_name, "SW_CC_STATE", "running")
+            _last_state_set[tmux_session_name] = now
     except Exception:
         invalidate_pane_cache(tmux_session_name)
         logger.debug("Failed to send keys to tmux session", extra={"session": tmux_session_name})
@@ -173,6 +181,31 @@ def is_session_alive(tmux_session_name: str) -> bool:
         return pane is not None and getattr(pane, "pane_dead", None) != "1"
     except Exception:
         return False
+
+
+def detect_session_state(session_name: str) -> SessionState:
+    """Detect state for a single session using raw subprocess (~7ms vs ~29ms via libtmux)."""
+    pane = _get_pane(session_name)
+    if pane is None:
+        return SessionState.DEAD
+    try:
+        if getattr(pane, "pane_dead", None) == "1":
+            return SessionState.DEAD
+        # Raw subprocess is ~4x faster than libtmux's show_environment()
+        result = subprocess.run(
+            ["tmux", "show-environment", "-t", session_name, "SW_CC_STATE"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode != 0:
+            return SessionState.UNKNOWN
+        # Output format: "SW_CC_STATE=waiting_input" or "-SW_CC_STATE" (unset)
+        line = result.stdout.strip()
+        if "=" in line:
+            value = line.split("=", 1)[1]
+            return _STATE_MAP.get(value, SessionState.UNKNOWN)
+        return SessionState.UNKNOWN
+    except Exception:
+        return SessionState.UNKNOWN
 
 
 def batch_detect_session_states(session_names: list[str]) -> dict[str, SessionState]:

@@ -74,6 +74,7 @@ class SuperWorkerApp(App):
         self._active_project_view: ProjectView | None = None
         self._open_configs: list[ResolvedConfig] = []
         self._initial_project: tuple[ResolvedConfig, object] | None = None
+        self._attention_paths: set[str] = set()
 
         try:
             config = load_config()
@@ -134,6 +135,15 @@ class SuperWorkerApp(App):
                 exclusive=True,
                 name="periodic-refresh",
             )
+        # Check states for non-active projects so attention indicators update
+        for cfg in self._open_configs:
+            pv_id = f"pv-{cfg.state_hash}"
+            try:
+                pv = self.query_one(f"#{pv_id}", ProjectView)
+                if pv is not self._active_project_view:
+                    self.run_worker(pv.check_attention, exclusive=False)
+            except Exception:
+                pass
 
     # ── Project drawer / tab bar ──────────────────────────────────────────────
 
@@ -142,9 +152,13 @@ class SuperWorkerApp(App):
         current = str(self._active_project_view.config.repo_root) if self._active_project_view else None
         open_paths = {str(cfg.repo_root) for cfg in self._open_configs}
         try:
-            self.query_one(ProjectDrawer).refresh_projects(projects, current=current, open_paths=open_paths)
+            self.query_one(ProjectDrawer).refresh_projects(
+                projects, current=current, open_paths=open_paths,
+                attention_paths=self._attention_paths,
+            )
             self.query_one(ProjectTabBar).refresh_projects(
-                all_projects=projects, open_paths=open_paths, current=current
+                all_projects=projects, open_paths=open_paths, current=current,
+                attention_paths=self._attention_paths,
             )
         except Exception:
             pass
@@ -163,6 +177,14 @@ class SuperWorkerApp(App):
         else:
             tab_bar.hide()
             drawer.open()
+
+    def on_project_view_attention_changed(self, event: ProjectView.AttentionChanged) -> None:
+        """A project's attention state changed — update drawer/tab bar."""
+        if event.needs_attention:
+            self._attention_paths.add(event.path)
+        else:
+            self._attention_paths.discard(event.path)
+        self._refresh_drawer()
 
     def on_project_selected(self, event: ProjectSelected) -> None:
         async def _open():

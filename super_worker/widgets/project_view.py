@@ -11,6 +11,7 @@ import webbrowser
 import git as gitpython
 from textual.app import ComposeResult
 from textual.containers import Horizontal
+from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Static, TabPane, TabbedContent
 
@@ -98,6 +99,14 @@ class WorktreeTabContent(Horizontal):
 class ProjectView(Widget):
     """Self-contained per-project widget: worktree tabs + session/git management."""
 
+    class AttentionChanged(Message):
+        """Posted when the project's attention state (any session waiting approval) changes."""
+
+        def __init__(self, path: str, needs_attention: bool) -> None:
+            self.path = path
+            self.needs_attention = needs_attention
+            super().__init__()
+
     DEFAULT_CSS = """
     ProjectView {
         width: 1fr;
@@ -172,16 +181,16 @@ class ProjectView(Widget):
             self.run_worker(_initial_refresh, exclusive=False)
 
     def _tab_label(self, wt: Worktree, git_data: tuple[dict, bool] | None = None) -> str:
-        if git_data is None:
-            return wt.name
-        status, dirty = git_data
-        dirty_marker = " *" if dirty else ""
         attention = ""
         for s in wt.sessions:
             state = self._cached_session_states.get(s.tmux_session_name, SessionState.RUNNING)
             if state == SessionState.WAITING_APPROVAL:
                 attention = " 🔔"
                 break
+        if git_data is None:
+            return f"{wt.name}{attention}"
+        status, dirty = git_data
+        dirty_marker = " *" if dirty else ""
         return f"{wt.name} (↑{status['ahead']} ↓{status['behind']}){dirty_marker}{attention}"
 
     def _update_app_subtitle(self, session_label: str | None = None) -> None:
@@ -216,6 +225,39 @@ class ProjectView(Widget):
             wt = self._state.get_worktree(name)
             if wt:
                 self._set_active_worktree(wt)
+
+    def on_terminal_pane_content_changed(self, event: TerminalPane.ContentChanged) -> None:
+        """Pane output changed — check all session states so indicators update fast."""
+        all_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
+        if all_names:
+            self.run_worker(self._check_all_states(all_names), exclusive=False)
+
+    async def _check_all_states(self, session_names: list[str]) -> None:
+        """Check all session states in background thread; update UI only on change."""
+        states = await asyncio.to_thread(batch_detect_session_states, session_names)
+        if states == {k: self._cached_session_states.get(k) for k in states}:
+            return
+        old_attention = any(
+            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
+        )
+        self._cached_session_states.update(states)
+        new_attention = any(
+            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
+        )
+        if old_attention != new_attention:
+            self.post_message(self.AttentionChanged(
+                str(self._config.repo_root), new_attention
+            ))
+        for wt in self._state.worktrees:
+            self._refresh_tab_label(wt, git_data=None)
+        wt = self._active_worktree
+        if wt:
+            try:
+                wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+                sidebar = wtc.query_one(SessionSidebar)
+                sidebar.show_worktree(wt, states=self._cached_session_states)
+            except Exception:
+                pass
 
     def on_session_selected(self, event: SessionSelected) -> None:
         self._active_worktree = event.worktree
@@ -526,13 +568,41 @@ class ProjectView(Widget):
 
     # ── Periodic refresh ──────────────────────────────────────────────────────
 
-    async def periodic_refresh(self) -> None:
-        """Fetch all blocking data in threads, then update UI. Called by app timer."""
+    async def check_attention(self) -> None:
+        """Lightweight state-only check for non-active projects."""
+        old_attention = any(
+            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
+        )
         all_session_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
         if all_session_names:
             self._cached_session_states = await asyncio.to_thread(batch_detect_session_states, all_session_names)
         else:
             self._cached_session_states = {}
+        new_attention = any(
+            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
+        )
+        if old_attention != new_attention:
+            self.post_message(self.AttentionChanged(
+                str(self._config.repo_root), new_attention
+            ))
+
+    async def periodic_refresh(self) -> None:
+        """Fetch all blocking data in threads, then update UI. Called by app timer."""
+        old_attention = any(
+            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
+        )
+        all_session_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
+        if all_session_names:
+            self._cached_session_states = await asyncio.to_thread(batch_detect_session_states, all_session_names)
+        else:
+            self._cached_session_states = {}
+        new_attention = any(
+            v == SessionState.WAITING_APPROVAL for v in self._cached_session_states.values()
+        )
+        if old_attention != new_attention:
+            self.post_message(self.AttentionChanged(
+                str(self._config.repo_root), new_attention
+            ))
 
         git_data: dict[str, tuple[dict, bool]] = {}
         if self._state.worktrees:
