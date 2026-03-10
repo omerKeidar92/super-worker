@@ -99,7 +99,7 @@ def new(name: str, branch: str | None, prompt: str | None, skip_permissions: boo
     state.worktrees.append(wt)
     click.echo(f"Created worktree: {wt.path} (branch: {wt.branch})")
 
-    if prompt:
+    if prompt or skip_permissions:
         session = create_session(wt, prompt=prompt, label=prompt, skip_permissions=skip_permissions)
         wt.sessions.append(session)
         click.echo(f"Launched session: {session.tmux_session_name} ({session.label})")
