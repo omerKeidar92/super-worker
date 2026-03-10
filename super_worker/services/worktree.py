@@ -19,6 +19,15 @@ _branch_status_cache: dict[str, tuple[float, dict]] = {}
 _dirty_cache: dict[str, tuple[float, bool]] = {}
 
 
+def list_local_branches(repo: Path) -> list[str]:
+    """Return sorted list of local branch names."""
+    try:
+        git_repo = gitpython.Repo(repo)
+        return sorted(h.name for h in git_repo.heads)
+    except Exception:
+        return []
+
+
 def _branch_exists(repo: Path, branch: str) -> bool:
     """Check if a local branch exists."""
     try:
