@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -92,9 +93,7 @@ class TerminalPane(Widget, can_focus=True):
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        if self._trailing_timer is not None:
-            self._trailing_timer.stop()
-            self._trailing_timer = None
+        self._cancel_trailing_timer()
         self._last_render_request = 0.0
         self._last_hash = _NO_HASH
         self._last_successful_render = 0.0
@@ -124,9 +123,7 @@ class TerminalPane(Widget, can_focus=True):
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        if self._trailing_timer is not None:
-            self._trailing_timer.stop()
-            self._trailing_timer = None
+        self._cancel_trailing_timer()
 
     def resume_watching(self) -> None:
         """Restart pipe-pane output watching after a pause.
@@ -169,29 +166,36 @@ class TerminalPane(Widget, can_focus=True):
     def _on_pane_output(self) -> None:
         """Called by PaneWatcher when pipe-pane file has new data.
 
-        Uses call_later for immediate scheduling, with time-based debounce
-        to avoid flooding. A trailing timer ensures the last event in a burst
-        always triggers a render (otherwise display stays stale until fallback).
+        Calls _poll_pane() directly (not via Textual's call_later which waits
+        for the message queue to be idle — that never happens during typing).
+        A trailing asyncio timer ensures the last event in a burst always
+        triggers a render.
         """
         try:
             now = time.monotonic()
             elapsed = now - self._last_render_request
             if elapsed >= _RENDER_DEBOUNCE_S:
-                # Enough time passed — schedule render immediately
                 self._last_render_request = now
-                if self._trailing_timer is not None:
-                    self._trailing_timer.stop()
-                    self._trailing_timer = None
-                self.call_later(self._poll_pane)
+                self._cancel_trailing_timer()
+                self._poll_pane()
             else:
-                # Too soon — set a trailing timer so we capture after the burst
+                # Too soon — set a trailing asyncio timer (bypasses message queue)
                 if self._trailing_timer is None:
                     remaining = _RENDER_DEBOUNCE_S - elapsed
-                    self._trailing_timer = self.set_timer(
-                        remaining, self._trailing_poll
-                    )
+                    try:
+                        loop = asyncio.get_running_loop()
+                        self._trailing_timer = loop.call_later(
+                            remaining, self._trailing_poll
+                        )
+                    except RuntimeError:
+                        pass
         except Exception:
             pass
+
+    def _cancel_trailing_timer(self) -> None:
+        if self._trailing_timer is not None:
+            self._trailing_timer.cancel()
+            self._trailing_timer = None
 
     def _trailing_poll(self) -> None:
         """Fires after debounce window — captures the final state after a burst."""
@@ -255,9 +259,7 @@ class TerminalPane(Widget, can_focus=True):
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        if self._trailing_timer is not None:
-            self._trailing_timer.stop()
-            self._trailing_timer = None
+        self._cancel_trailing_timer()
         self._watcher.cleanup()
 
     def _send_keys_async(self, *keys: str, literal: bool = False) -> None:
