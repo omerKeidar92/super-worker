@@ -62,39 +62,53 @@ def state_dir(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 1. Single kqueue thread after init
+# 1. Thread-pool configuration and behaviour
 # ---------------------------------------------------------------------------
 
 class TestThreading:
-    def test_single_sw_kqueue_thread_exists_after_init(self, watcher):
-        """Exactly one 'sw-kqueue' daemon thread is running after init."""
+    def test_kqueue_executor_max_workers_is_one(self):
+        """The module-level _KQUEUE_EXECUTOR must be limited to exactly 1 worker."""
+        from super_worker.services.pane_watcher import _KQUEUE_EXECUTOR
+        assert _KQUEUE_EXECUTOR._max_workers == 1
+
+    @pytest.mark.asyncio
+    async def test_only_one_kqueue_thread_after_trigger(self, watcher, state_dir, monkeypatch):
+        """After triggering the watch loop, at most one sw-kqueue thread is alive."""
+        import super_worker.constants as _constants
+        monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
+
+        watcher.start_watching_state("thread-count-test", lambda n: None)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_to_file, state_dir / "thread-count-test")
+        await asyncio.sleep(0.3)
+
         kq_threads = [
             t for t in threading.enumerate()
-            if t.name == "sw-kqueue" and t.is_alive()
+            if t.name.startswith("sw-kqueue") and t.is_alive()
         ]
-        assert len(kq_threads) == 1, (
-            f"Expected exactly 1 'sw-kqueue' thread, found {len(kq_threads)}"
-        )
+        # The executor creates at most 1 thread (max_workers=1)
+        assert len(kq_threads) <= 1
 
-    def test_thread_is_daemon(self, watcher):
-        """The kqueue thread must be a daemon so it doesn't block interpreter exit."""
-        kq_threads = [
-            t for t in threading.enumerate()
-            if t.name == "sw-kqueue" and t.is_alive()
-        ]
-        assert kq_threads, "No sw-kqueue thread found"
-        assert kq_threads[0].daemon is True
+    @pytest.mark.asyncio
+    async def test_no_new_threads_on_additional_watches(self, watcher, state_dir, monkeypatch):
+        """Adding more state watches must not spawn extra threads beyond the single executor thread."""
+        import super_worker.constants as _constants
+        monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
 
-    def test_no_new_threads_on_additional_watches(self, watcher, state_dir):
-        """Adding more watches must not spawn additional threads."""
-        initial_count = threading.active_count()
+        # Trigger the watch loop (creates the executor thread)
+        watcher.start_watching_state("thread-base", lambda n: None)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_to_file, state_dir / "thread-base")
+        await asyncio.sleep(0.3)
 
+        before = threading.active_count()
         for name in ("sess-a", "sess-b", "sess-c"):
             watcher.start_watching_state(name, lambda n: None)
+        await asyncio.sleep(0.1)
+        after = threading.active_count()
 
-        # Allow thread count to settle
-        time.sleep(0.1)
-        assert threading.active_count() <= initial_count + 1  # at most +1 for the existing kq thread
+        # Adding watches must not spawn additional threads
+        assert after <= before + 1
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +139,7 @@ class TestPipeWatchStartStop:
         fd = os.open(str(pipe_path), os.O_RDONLY)
         from super_worker.services.pane_watcher import _Watch
         watch = _Watch(fd=fd, callback=lambda: None, callback_arg=None,
-                       pipe_path=pipe_path, session_name="manual-sess")
+                       pipe_path=pipe_path)
         watcher._register(watch)
         with watcher._lock:
             watcher._pipe_watches["manual-sess"] = watch
@@ -140,7 +154,7 @@ class TestPipeWatchStartStop:
         fd = os.open(str(pipe_path), os.O_RDONLY)
         from super_worker.services.pane_watcher import _Watch
         watch = _Watch(fd=fd, callback=lambda: None, callback_arg=None,
-                       pipe_path=pipe_path, session_name="stop-sess")
+                       pipe_path=pipe_path)
         watcher._register(watch)
         with watcher._lock:
             watcher._pipe_watches["stop-sess"] = watch
@@ -162,34 +176,25 @@ class TestCallbackFiring:
     @pytest.mark.asyncio
     async def test_state_callback_fires_on_write(self, watcher, state_dir, monkeypatch):
         """Writing to a state file should trigger the callback via kqueue."""
-        # Patch SESSION_STATES_DIR inside pane_watcher module
         import super_worker.constants as _constants
         monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
 
         called_with: list[str] = []
 
-        async def _run():
-            # Set the loop on the watcher so callbacks can be dispatched
-            watcher._loop = asyncio.get_running_loop()
+        def cb(session_name: str) -> None:
+            called_with.append(session_name)
 
-            def cb(session_name: str) -> None:
-                called_with.append(session_name)
+        watcher.start_watching_state("sess-fire", cb)
 
-            watcher.start_watching_state("sess-fire", cb)
+        state_file = state_dir / "sess-fire"
+        assert state_file.exists(), "start_watching_state must touch() the state file"
 
-            state_file = state_dir / "sess-fire"
-            assert state_file.exists(), "start_watching_state must touch() the state file"
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_to_file, state_file)
 
-            # Write from a thread (simulates real state update)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, _write_to_file, state_file)
-
-            # Wait up to 5 s for the callback
-            met = await _wait_for(lambda: len(called_with) > 0, timeout=5.0)
-            assert met, "Callback was not called within 5 seconds after writing to state file"
-            assert called_with[0] == "sess-fire"
-
-        await _run()
+        met = await _wait_for(lambda: len(called_with) > 0, timeout=5.0)
+        assert met, "Callback was not called within 5 seconds after writing to state file"
+        assert called_with[0] == "sess-fire"
 
     @pytest.mark.asyncio
     async def test_state_callback_receives_correct_session_name(self, watcher, state_dir, monkeypatch):
@@ -198,7 +203,6 @@ class TestCallbackFiring:
         monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
 
         fired: list[str] = []
-        watcher._loop = asyncio.get_running_loop()
         watcher.start_watching_state("my-session", lambda n: fired.append(n))
 
         loop = asyncio.get_running_loop()
@@ -212,7 +216,6 @@ class TestCallbackFiring:
     async def test_pipe_callback_fires_on_write(self, watcher):
         """A manually-registered pipe watch callback fires when the file is written."""
         fired: list[int] = []
-        watcher._loop = asyncio.get_running_loop()
 
         pipe_path = watcher._pipe_dir / "pipe-fire-test.pipe"
         watcher._pipe_dir.mkdir(parents=True, exist_ok=True)
@@ -224,8 +227,7 @@ class TestCallbackFiring:
         def cb():
             fired.append(1)
 
-        watch = _Watch(fd=fd, callback=cb, callback_arg=None,
-                       pipe_path=pipe_path, session_name="pipe-fire-test")
+        watch = _Watch(fd=fd, callback=cb, callback_arg=None, pipe_path=pipe_path)
         watcher._register(watch)
         with watcher._lock:
             watcher._pipe_watches["pipe-fire-test"] = watch
@@ -248,7 +250,6 @@ class TestMultipleWatches:
         import super_worker.constants as _constants
         monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
 
-        watcher._loop = asyncio.get_running_loop()
         fired: dict[str, list[str]] = {"a": [], "b": [], "c": []}
 
         watcher.start_watching_state("sess-a", lambda n: fired["a"].append(n))
@@ -271,7 +272,6 @@ class TestMultipleWatches:
         import super_worker.constants as _constants
         monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
 
-        watcher._loop = asyncio.get_running_loop()
         fired: dict[str, list[str]] = {"x": [], "y": [], "z": []}
 
         for name in ("x", "y", "z"):
@@ -298,7 +298,6 @@ class TestReplaceWatch:
         import super_worker.constants as _constants
         monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
 
-        watcher._loop = asyncio.get_running_loop()
         first_fired: list[str] = []
         second_fired: list[str] = []
 
@@ -329,7 +328,7 @@ class TestReplaceWatch:
         fd1 = os.open(str(pipe_path), os.O_RDONLY)
         from super_worker.services.pane_watcher import _Watch
         w1 = _Watch(fd=fd1, callback=lambda: None, callback_arg=None,
-                    pipe_path=pipe_path, session_name="dup-pipe")
+                    pipe_path=pipe_path)
         watcher._register(w1)
         with watcher._lock:
             watcher._pipe_watches["dup-pipe"] = w1
@@ -344,7 +343,7 @@ class TestReplaceWatch:
         pipe_path.touch()
         fd2 = os.open(str(pipe_path), os.O_RDONLY)
         w2 = _Watch(fd=fd2, callback=lambda: None, callback_arg=None,
-                    pipe_path=pipe_path, session_name="dup-pipe")
+                    pipe_path=pipe_path)
         watcher._register(w2)
         with watcher._lock:
             watcher._pipe_watches["dup-pipe"] = w2
@@ -357,17 +356,28 @@ class TestReplaceWatch:
 # ---------------------------------------------------------------------------
 
 class TestCleanup:
-    def test_cleanup_stops_watch_thread(self, watcher):
-        """cleanup() must cause the 'sw-kqueue' thread to stop within 3 s."""
-        thread = next(
-            (t for t in threading.enumerate() if t.name == "sw-kqueue" and t.is_alive()),
-            None
-        )
-        assert thread is not None, "No sw-kqueue thread found before cleanup"
+    @pytest.mark.asyncio
+    async def test_cleanup_stops_running_and_cancels_task(self, watcher, state_dir, monkeypatch):
+        """cleanup() sets _running=False and cancels the asyncio task."""
+        import super_worker.constants as _constants
+        monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
+
+        # Trigger the watch loop so the task is created
+        watcher.start_watching_state("cleanup-test", lambda n: None)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_to_file, state_dir / "cleanup-test")
+        await asyncio.sleep(0.2)
+
+        task = watcher._task
+        assert task is not None, "Watch task should be running"
+        assert not task.done(), "Watch task should still be running"
 
         watcher.cleanup()
-        thread.join(timeout=3.0)
-        assert not thread.is_alive(), "sw-kqueue thread still alive 3 s after cleanup()"
+
+        assert watcher._running is False
+        # Give task a moment to be cancelled
+        await asyncio.sleep(0.6)
+        assert task.done(), "Watch task should be done after cleanup"
 
     def test_cleanup_clears_all_watches(self, watcher, state_dir, monkeypatch):
         """cleanup() removes all registered watches."""
@@ -419,7 +429,6 @@ class TestStopWatchingState:
         import super_worker.constants as _constants
         monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
 
-        watcher._loop = asyncio.get_running_loop()
         fired: list[str] = []
 
         watcher.start_watching_state("stopped-sess", lambda n: fired.append(n))
