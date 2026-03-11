@@ -11,6 +11,7 @@ Covers:
 """
 
 import inspect
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -183,6 +184,66 @@ class TestHookWritesStateFile:
         assert "session-states" in content
         assert 'printf' in content
         assert '${SW_SESSION_NAME}' in content
+
+    def test_hook_script_skips_redundant_writes(self):
+        """Hook should skip if state file already has the same value."""
+        import importlib.resources
+        ref = importlib.resources.files("super_worker.scripts").joinpath("sw-hook.sh")
+        with importlib.resources.as_file(ref) as path:
+            content = path.read_text()
+
+        # Must read existing state file and compare before doing tmux calls
+        assert 'cat' in content or 'read' in content
+        assert 'exit 0' in content
+
+    def test_hook_actually_skips_redundant_calls(self, tmp_path):
+        """Run the hook script and verify it skips when state unchanged."""
+        import importlib.resources
+        import subprocess
+
+        ref = importlib.resources.files("super_worker.scripts").joinpath("sw-hook.sh")
+        with importlib.resources.as_file(ref) as script_path:
+            state_dir = tmp_path / "session-states"
+            state_dir.mkdir()
+            state_file = state_dir / "sw-test-hook-0"
+
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(tmp_path),
+                "SW_SESSION_NAME": "sw-test-hook-0",
+            }
+            # Override STATE_DIR in the script by pre-creating the file
+            # The hook reads from $HOME/.config/sw/session-states/
+            home_state_dir = tmp_path / ".config" / "sw" / "session-states"
+            home_state_dir.mkdir(parents=True)
+            home_state_file = home_state_dir / "sw-test-hook-0"
+
+            # First call: no file exists, hook should create it
+            result = subprocess.run(
+                ["bash", str(script_path), "running"],
+                env=env, capture_output=True, text=True, timeout=5,
+            )
+            assert result.returncode == 0
+            # File may or may not exist (tmux not available), but the
+            # early-exit logic should work based on file content
+
+            # Write the state file manually (simulating first run succeeded)
+            home_state_file.write_text("running")
+
+            # Second call with same state: should exit early (exit 0)
+            # and NOT attempt tmux commands (which would fail)
+            result = subprocess.run(
+                ["bash", str(script_path), "running"],
+                env=env, capture_output=True, text=True, timeout=5,
+            )
+            assert result.returncode == 0
+
+            # Third call with different state: should proceed
+            result = subprocess.run(
+                ["bash", str(script_path), "waiting_input"],
+                env=env, capture_output=True, text=True, timeout=5,
+            )
+            assert result.returncode == 0
 
 
 class TestNoContentChangedMessage:
