@@ -49,6 +49,11 @@ def _build_hooks() -> dict[str, list[dict]]:
                 "hooks": [{"type": "command", "command": f"{cmd} running"}],
             }
         ],
+        "PostToolUse": [
+            {
+                "hooks": [{"type": "command", "command": f"{cmd} running"}],
+            }
+        ],
     }
 
 
