@@ -189,9 +189,6 @@ class PaneWatcher:
                 # Check for changes — run in thread to avoid blocking the event loop
                 events = await asyncio.to_thread(kq.control, None, 1, 0.5)
                 if events:
-                    # Debounce: wait for burst writes to settle
-                    await asyncio.sleep(0.016)
-
                     # Truncate the pipe file to prevent unbounded growth.
                     # The file is only a notification channel — we never read it.
                     try:

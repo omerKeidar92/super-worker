@@ -45,6 +45,7 @@ class TerminalPane(Widget, can_focus=True):
             self.session_name = session_name
             super().__init__()
 
+
     active_session: reactive[str | None] = reactive(None)
 
     DEFAULT_CSS = """
@@ -72,7 +73,8 @@ class TerminalPane(Widget, can_focus=True):
         super().__init__()
         self._last_hash: int | object = _NO_HASH
         self._fallback_timer = None
-        self._render_timer = None
+        self._trailing_timer = None
+        self._last_render_request: float = 0.0
         self._last_successful_render: float = 0.0
         self._watcher = PaneWatcher()
         self._watched_state_sessions: set[str] = set()
@@ -90,9 +92,10 @@ class TerminalPane(Widget, can_focus=True):
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        if self._render_timer is not None:
-            self._render_timer.stop()
-            self._render_timer = None
+        if self._trailing_timer is not None:
+            self._trailing_timer.stop()
+            self._trailing_timer = None
+        self._last_render_request = 0.0
         self._last_hash = _NO_HASH
         self._last_successful_render = 0.0
         if not session_name:
@@ -131,23 +134,36 @@ class TerminalPane(Widget, can_focus=True):
             pass
 
     def _on_pane_output(self) -> None:
-        """Called by PaneWatcher when pipe-pane file has new data."""
+        """Called by PaneWatcher when pipe-pane file has new data.
+
+        Uses call_later for immediate scheduling, with time-based debounce
+        to avoid flooding. A trailing timer ensures the last event in a burst
+        always triggers a render (otherwise display stays stale until fallback).
+        """
         try:
-            # Coalesce rapid kqueue events into periodic renders.
-            # If a timer is already pending, let it fire — don't reset it.
-            # This gives ~20 renders/sec during typing (1/RENDER_DEBOUNCE_S)
-            # instead of starving until typing stops.
-            if self._render_timer is not None:
-                return  # Timer already pending, will fire soon
-            self._render_timer = self.set_timer(
-                _RENDER_DEBOUNCE_S, self._debounced_poll
-            )
+            now = time.monotonic()
+            elapsed = now - self._last_render_request
+            if elapsed >= _RENDER_DEBOUNCE_S:
+                # Enough time passed — schedule render immediately
+                self._last_render_request = now
+                if self._trailing_timer is not None:
+                    self._trailing_timer.stop()
+                    self._trailing_timer = None
+                self.call_later(self._poll_pane)
+            else:
+                # Too soon — set a trailing timer so we capture after the burst
+                if self._trailing_timer is None:
+                    remaining = _RENDER_DEBOUNCE_S - elapsed
+                    self._trailing_timer = self.set_timer(
+                        remaining, self._trailing_poll
+                    )
         except Exception:
             pass
 
-    def _debounced_poll(self) -> None:
-        """Fires after the render debounce window closes."""
-        self._render_timer = None
+    def _trailing_poll(self) -> None:
+        """Fires after debounce window — captures the final state after a burst."""
+        self._trailing_timer = None
+        self._last_render_request = time.monotonic()
         self._poll_pane()
 
     def _poll_pane(self) -> None:
@@ -206,9 +222,9 @@ class TerminalPane(Widget, can_focus=True):
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        if self._render_timer is not None:
-            self._render_timer.stop()
-            self._render_timer = None
+        if self._trailing_timer is not None:
+            self._trailing_timer.stop()
+            self._trailing_timer = None
         self._watcher.cleanup()
 
     def _send_keys_async(self, *keys: str, literal: bool = False) -> None:
