@@ -1,6 +1,5 @@
 import logging
 import re
-import time
 
 from rich.text import Text
 from textual.events import Click, Key, Paste
@@ -26,9 +25,6 @@ _NO_HASH = object()
 
 # If no successful render for this long, force a re-capture (empty screen recovery)
 _FORCE_REFRESH_S = 3.0
-
-# Debounce kqueue-triggered renders to coalesce rapid updates during typing
-_RENDER_DEBOUNCE_S = 0.05
 
 
 class TerminalPane(Widget, can_focus=True):
@@ -73,8 +69,6 @@ class TerminalPane(Widget, can_focus=True):
         super().__init__()
         self._last_hash: int | object = _NO_HASH
         self._fallback_timer = None
-        self._trailing_timer = None
-        self._last_render_request: float = 0.0
         self._last_successful_render: float = 0.0
         self._watcher = PaneWatcher()
         self._watched_state_sessions: set[str] = set()
@@ -87,13 +81,9 @@ class TerminalPane(Widget, can_focus=True):
             yield content
 
     def watch_active_session(self, old_value: str | None, session_name: str | None) -> None:
-        if old_value:
-            self._watcher.stop_watching(old_value)
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        self._cancel_trailing_timer()
-        self._last_render_request = 0.0
         self._last_hash = _NO_HASH
         self._last_successful_render = 0.0
         if not session_name:
@@ -106,38 +96,22 @@ class TerminalPane(Widget, can_focus=True):
         if session_name:
             # Don't blank the screen — keep stale content visible until the
             # first capture arrives, avoiding the black-screen flash.
-            self._watcher.start_watching(session_name, self._on_pane_output)
             self._poll_pane()  # Initial capture
             self._fallback_timer = self.set_interval(PANE_FALLBACK_POLL_S, self._poll_pane)
 
     def pause_watching(self) -> None:
-        """Stop pipe-pane output watching without clearing content or state watches.
-
-        Called when the worktree tab becomes inactive. Preserves displayed
-        content and active_session so resuming is seamless.
-        """
-        session = self.active_session
-        if session:
-            self._watcher.stop_watching(session)
+        """Stop polling when this worktree tab becomes inactive."""
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        self._cancel_trailing_timer()
 
     def resume_watching(self) -> None:
-        """Restart pipe-pane output watching after a pause.
-
-        Called when the worktree tab becomes active again. Does a fresh
-        capture and restarts the kqueue watcher + fallback timer.
-        """
-        session = self.active_session
-        if not session:
+        """Resume polling when this worktree tab becomes active again."""
+        if not self.active_session:
             return
-        # Avoid double-watching if already active
-        if self._watcher.is_watching(session):
-            return
-        self._watcher.start_watching(session, self._on_pane_output)
-        self._last_hash = _NO_HASH  # Force re-render
+        if self._fallback_timer is not None:
+            return  # Already running
+        self._last_hash = _NO_HASH  # Force re-render on resume
         self._poll_pane()
         self._fallback_timer = self.set_interval(PANE_FALLBACK_POLL_S, self._poll_pane)
 
@@ -147,10 +121,8 @@ class TerminalPane(Widget, can_focus=True):
         Adds new watches and removes stale ones. Safe to call repeatedly.
         """
         new_set = set(session_names)
-        # Stop watching sessions no longer in the list
         for name in self._watched_state_sessions - new_set:
             self._watcher.stop_watching_state(name)
-        # Start watching new sessions
         for name in new_set - self._watched_state_sessions:
             self._watcher.start_watching_state(name, self._on_state_changed)
         self._watched_state_sessions = new_set
@@ -162,47 +134,12 @@ class TerminalPane(Widget, can_focus=True):
         except Exception:
             pass
 
-    def _on_pane_output(self) -> None:
-        """Called by PaneWatcher when pipe-pane file has new data.
-
-        Uses call_later to schedule a render after the current message, with
-        time-based debounce to coalesce rapid events. The set_interval fallback
-        timer (150ms) handles updates during continuous typing since it calls
-        its callback directly without going through the message queue.
-        """
-        try:
-            now = time.monotonic()
-            elapsed = now - self._last_render_request
-            if elapsed >= _RENDER_DEBOUNCE_S:
-                self._last_render_request = now
-                self._cancel_trailing_timer()
-                self.call_later(self._poll_pane)
-            else:
-                if self._trailing_timer is None:
-                    remaining = _RENDER_DEBOUNCE_S - elapsed
-                    self._trailing_timer = self.set_timer(remaining, self._trailing_poll)
-        except Exception:
-            pass
-
-    def _cancel_trailing_timer(self) -> None:
-        if self._trailing_timer is not None:
-            self._trailing_timer.stop()
-            self._trailing_timer = None
-
-    def _trailing_poll(self) -> None:
-        """Fires after debounce window — captures the final state after a burst."""
-        self._trailing_timer = None
-        self._last_render_request = time.monotonic()
-        self._poll_pane()
-
     def _poll_pane(self) -> None:
         session = self.active_session
         if not session:
             return
-        # Empty screen recovery: if no successful render recently, reset hash
-        # so the next capture is guaranteed to produce a widget update.
-        now = time.monotonic()
-        if (now - self._last_successful_render) > _FORCE_REFRESH_S:
+        import time
+        if (time.monotonic() - self._last_successful_render) > _FORCE_REFRESH_S:
             self._last_hash = _NO_HASH
         self.run_worker(lambda: self._capture(session), thread=True, exclusive=True)
 
@@ -218,6 +155,7 @@ class TerminalPane(Widget, can_focus=True):
         if event.state != WorkerState.SUCCESS or event.worker.result is None:
             return
         self._last_hash = event.worker.result[0]
+        import time
         self._last_successful_render = time.monotonic()
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
@@ -251,11 +189,10 @@ class TerminalPane(Widget, can_focus=True):
         if self._fallback_timer is not None:
             self._fallback_timer.stop()
             self._fallback_timer = None
-        self._cancel_trailing_timer()
         self._watcher.cleanup()
 
     def _send_keys_async(self, *keys: str, literal: bool = False) -> None:
-        """Send keys off the event loop. kqueue watcher handles rendering."""
+        """Send keys off the event loop."""
         session = self.active_session
         if not session:
             return
