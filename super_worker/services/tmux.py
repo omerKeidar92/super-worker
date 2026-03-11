@@ -267,16 +267,12 @@ def create_session(
 
 
 def capture_pane(tmux_session_name: str) -> str:
-    """Capture visible pane content with ANSI escapes.
-
-    Only captures the visible area (no scrollback) to keep rendering fast.
-    Full scrollback is available via Ctrl+A (tmux attach).
-    """
+    """Capture pane content with scrollback history and ANSI escapes."""
     pane = _get_pane(tmux_session_name)
     if pane is None:
         return f"[Session {tmux_session_name} not found]"
     try:
-        lines = pane.capture_pane(escape_sequences=True)
+        lines = pane.capture_pane(start=-500, escape_sequences=True)
         return "\n".join(lines)
     except Exception:
         invalidate_pane_cache(tmux_session_name)

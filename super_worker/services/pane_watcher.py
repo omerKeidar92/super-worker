@@ -1,6 +1,7 @@
 """Watch tmux pane output and session state files via kqueue for efficient updates."""
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import select
@@ -11,6 +12,16 @@ from pathlib import Path
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+# Dedicated thread pool for kqueue blocking calls.
+# Isolated from asyncio's default pool so kqueue threads (one per watched
+# file, blocking indefinitely with 0.5s timeout) don't starve capture and
+# send-keys workers. With 9 sessions = 10 kqueue threads needed vs 12 total
+# default threads, the default pool runs out leaving only 2 for real work.
+_KQUEUE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=64,  # one per watched file, very lightweight (just blocking)
+    thread_name_prefix="sw-kqueue",
+)
 
 
 @dataclass
@@ -185,9 +196,11 @@ class PaneWatcher:
             )
             kq.control([event], 0, 0)
 
+            loop = asyncio.get_running_loop()
             while self._running:
-                # Check for changes — run in thread to avoid blocking the event loop
-                events = await asyncio.to_thread(kq.control, None, 1, 0.5)
+                # Run in dedicated kqueue executor — isolated from asyncio's default
+                # thread pool so these blocking calls don't starve capture/send-keys.
+                events = await loop.run_in_executor(_KQUEUE_EXECUTOR, kq.control, None, 1, 0.5)
                 if events:
                     # Truncate the pipe file to prevent unbounded growth.
                     # The file is only a notification channel — we never read it.
@@ -229,8 +242,9 @@ class PaneWatcher:
             )
             kq.control([event], 0, 0)
 
+            loop = asyncio.get_running_loop()
             while self._running:
-                events = await asyncio.to_thread(kq.control, None, 1, 0.5)
+                events = await loop.run_in_executor(_KQUEUE_EXECUTOR, kq.control, None, 1, 0.5)
                 if events:
                     try:
                         watch.callback(session_name)
