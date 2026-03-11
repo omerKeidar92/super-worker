@@ -142,6 +142,11 @@ class PaneWatcher:
         with self._lock:
             self._state_watches[session_name] = watch
 
+    def is_watching(self, session_name: str) -> bool:
+        """Return True if pipe-pane output is currently being watched."""
+        with self._lock:
+            return session_name in self._pipe_watches
+
     def stop_watching_state(self, session_name: str) -> None:
         """Stop watching a session's state file."""
         with self._lock:

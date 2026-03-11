@@ -138,7 +138,7 @@ class TerminalPane(Widget, can_focus=True):
         if not session:
             return
         # Avoid double-watching if already active
-        if session in self._watcher._watches:
+        if self._watcher.is_watching(session):
             return
         self._watcher.start_watching(session, self._on_pane_output)
         self._last_hash = _NO_HASH  # Force re-render
