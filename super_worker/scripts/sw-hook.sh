@@ -12,5 +12,19 @@ fi
 
 # Only set state if we're inside a tmux session managed by SW
 if command -v tmux &>/dev/null && tmux has-session -t "$SW_SESSION_NAME" 2>/dev/null; then
-    tmux setenv -t "$SW_SESSION_NAME" SW_CC_STATE "$STATE"
+    if [ -n "${SW_FAST_MODE:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+        # Fast mode: per-pane state
+        tmux setenv -t "$SW_SESSION_NAME" "SW_CC_STATE_${TMUX_PANE}" "$STATE"
+        # Update pane border title for immediate visual feedback
+        case "$STATE" in
+            running)          ICON="●" ;;
+            waiting_input)    ICON="○" ;;
+            waiting_approval) ICON="◉" ;;
+            *)                ICON="?" ;;
+        esac
+        tmux select-pane -t "$TMUX_PANE" -T "${ICON} ${SW_PANE_LABEL:-session} [${SW_PANE_TYPE:-CC}]"
+    else
+        # TUI mode: per-session state (unchanged)
+        tmux setenv -t "$SW_SESSION_NAME" SW_CC_STATE "$STATE"
+    fi
 fi

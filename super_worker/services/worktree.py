@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import threading
 import time
+import webbrowser
 from pathlib import Path
 
 import git as gitpython
@@ -278,6 +279,70 @@ def invalidate_git_cache(wt_path: str) -> None:
     with _cache_lock:
         _branch_status_cache.pop(wt_path, None)
         _dirty_cache.pop(wt_path, None)
+
+
+# ---------------------------------------------------------------------------
+# Shared git operations (used by both TUI and fast mode)
+# ---------------------------------------------------------------------------
+
+
+def git_push(wt_path: str, remote: str, branch: str) -> str | None:
+    """Push branch to remote. Returns error message or None on success."""
+    try:
+        repo = gitpython.Repo(wt_path)
+        repo.git.push("-u", remote, branch)
+        invalidate_git_cache(wt_path)
+        return None
+    except gitpython.GitCommandError as e:
+        return str(e.stderr or e)[:200]
+
+
+def git_pull(wt_path: str, remote: str, main_branch: str) -> str | None:
+    """Pull main_branch from remote. Returns error message or None on success."""
+    try:
+        repo = gitpython.Repo(wt_path)
+        repo.git.pull(remote, main_branch)
+        invalidate_git_cache(wt_path)
+        return None
+    except gitpython.GitCommandError as e:
+        return str(e.stderr or e)[:200]
+
+
+def git_commit(wt_path: str, message: str) -> str | None:
+    """Stage modified files and commit. Returns error message or None on success."""
+    try:
+        repo = gitpython.Repo(wt_path)
+        repo.git.add("-u")
+        repo.git.commit("-m", message)
+        invalidate_git_cache(wt_path)
+        return None
+    except gitpython.GitCommandError as e:
+        return str(e.stderr or e)[:200]
+
+
+def git_create_pr(wt_path: str, branch: str, open_browser: bool = True) -> tuple[bool, str]:
+    """Create a GitHub PR via gh CLI. Returns (success, url_or_error).
+
+    If open_browser is True and PR creation succeeds, opens the URL in a browser.
+    """
+    # Check gh auth
+    result = subprocess.run(
+        ["gh", "auth", "status"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return False, "gh CLI not installed or not authenticated. Run: gh auth login"
+
+    result = subprocess.run(
+        ["gh", "pr", "create", "--fill", "--head", branch],
+        cwd=wt_path, capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode == 0:
+        url = result.stdout.strip()
+        if open_browser:
+            webbrowser.open(url)
+        return True, url
+    return False, (result.stderr or "")[:200]
 
 
 def discover_worktrees(config: ResolvedConfig) -> list[Worktree]:

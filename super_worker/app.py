@@ -11,13 +11,9 @@ from super_worker.config import ResolvedConfig, load_config
 from super_worker.constants import SIDEBAR_REFRESH_S
 from super_worker.services.hooks import install_hooks
 from super_worker.services.state import (
+    load_and_reconcile,
     load_projects_registry,
-    load_state,
-    reconcile_state,
-    recover_dead_sessions,
     remove_from_projects_registry,
-    save_state,
-    update_projects_registry,
 )
 from super_worker.widgets.project_drawer import (
     DockToggled,
@@ -78,12 +74,7 @@ class SuperWorkerApp(App):
 
         try:
             config = load_config()
-            state = load_state(config)
-            update_projects_registry(config)
-            changed = reconcile_state(state, config)
-            changed = recover_dead_sessions(state) or changed
-            if changed:
-                save_state(state, config)
+            state = load_and_reconcile(config)
             self._initial_project = (config, state)
             self._open_configs.append(config)
         except RuntimeError:
@@ -226,12 +217,7 @@ class SuperWorkerApp(App):
             self.notify(str(e), severity="error")
             return
 
-        new_state = await asyncio.to_thread(load_state, new_config)
-        await asyncio.to_thread(update_projects_registry, new_config)
-        changed = await asyncio.to_thread(reconcile_state, new_state, new_config)
-        changed = await asyncio.to_thread(recover_dead_sessions, new_state) or changed
-        if changed:
-            await asyncio.to_thread(save_state, new_state, new_config)
+        new_state = await asyncio.to_thread(load_and_reconcile, new_config)
 
         pv_id = f"pv-{new_config.state_hash}"
         pv = ProjectView(new_config, new_state, id=pv_id)
