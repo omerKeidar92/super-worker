@@ -6,7 +6,7 @@ SESSION_STATES_DIR = STATE_DIR / "session-states"
 TMUX_SESSION_PREFIX = "sw"
 POLL_INTERVAL_MS = 200  # Legacy: used as fallback only
 PANE_WATCHER_DEBOUNCE_MS = 16  # Debounce after kqueue signal
-PANE_FALLBACK_POLL_S = 5.0  # Safety net: kqueue handles real-time, this only catches missed events
+PANE_FALLBACK_POLL_S = 0.15  # Poll every 150ms — set_interval fires directly (bypasses message queue)
 SIDEBAR_REFRESH_S = 5
 
 DEFAULT_WORKTREE_NAME = "main"

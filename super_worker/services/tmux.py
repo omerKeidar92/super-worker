@@ -100,6 +100,47 @@ def read_all_state_files(session_names: list[str]) -> dict[str, SessionState]:
     return results
 
 
+def verify_waiting_approval(session_names: list[str]) -> dict[str, SessionState]:
+    """Cross-check sessions showing waiting_approval against tmux env.
+
+    State files can be stale for sessions started before the latest hook
+    script was installed. The tmux env (SW_CC_STATE) is set by both old
+    and new hooks, so it's always current. Only called for the subset of
+    sessions that appear to be waiting_approval — minimal overhead.
+
+    Returns corrected states. Also fixes the state files so the stale
+    state doesn't persist.
+    """
+    from super_worker.constants import SESSION_STATES_DIR
+    if not session_names:
+        return {}
+    server = _get_server()
+    try:
+        live = {s.session_name: s for s in server.sessions}
+    except Exception:
+        return {}
+    corrected: dict[str, SessionState] = {}
+    for name in session_names:
+        session = live.get(name)
+        if not session:
+            continue
+        try:
+            env = session.show_environment()
+            value = env.get("SW_CC_STATE", "")
+            real_state = _STATE_MAP.get(value, SessionState.UNKNOWN)
+            if real_state != SessionState.WAITING_APPROVAL:
+                corrected[name] = real_state
+                # Fix the stale state file
+                try:
+                    state_file = SESSION_STATES_DIR / name
+                    state_file.write_text(value or "")
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    return corrected
+
+
 def batch_check_alive(session_names: list[str]) -> set[str]:
     """Return the set of session names that are dead or missing.
 

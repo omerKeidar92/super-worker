@@ -1,272 +1,163 @@
-"""Watch tmux pane output and session state files via kqueue for efficient updates."""
+"""Watch session state files via kqueue for efficient bell-icon updates."""
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import select
-import subprocess
-import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class _PaneWatch:
-    """State for a single pane being watched."""
-
-    session_name: str
-    pipe_path: Path
-    callback: Callable
-    task: asyncio.Task | None = None
-    fd: int = -1
+# One dedicated thread for the blocking kqueue call.
+# Isolated from asyncio's default pool so it never starves capture/send-keys workers.
+_KQUEUE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="sw-kqueue",
+)
 
 
 @dataclass
-class _FileWatch:
-    """State for a watched file (used for state files)."""
-
-    path: Path
+class _Watch:
+    """A single watched fd with its dispatch callback."""
+    fd: int
     callback: Callable
-    task: asyncio.Task | None = None
-    fd: int = -1
+    callback_arg: str  # session_name for state watches
 
 
 class PaneWatcher:
-    """Watches tmux pane output via pipe-pane and notifies on changes.
+    """Watches session state files via kqueue for state change notifications.
 
-    Uses tmux pipe-pane to stream output to a file, then monitors the file
-    with kqueue (macOS) for changes. Only triggers capture-pane when there's
-    actual new content, eliminating polling overhead for idle sessions.
+    One asyncio task blocks on kq.control() in a dedicated 1-thread executor.
+    Callbacks are invoked directly from the asyncio task on the event loop.
     """
 
-    # Track all active pipe dirs across instances so cleanup doesn't nuke siblings
-    _active_pipe_dirs: set[Path] = set()
-
     def __init__(self) -> None:
-        self._watches: dict[str, _PaneWatch] = {}
-        self._state_watches: dict[str, _FileWatch] = {}
-        self._pipe_dir = Path(tempfile.mkdtemp(prefix="sw-pipes-"))
-        PaneWatcher._active_pipe_dirs.add(self._pipe_dir)
+        self._kq = select.kqueue()
+        self._lock = threading.Lock()
+        self._fd_to_watch: dict[int, _Watch] = {}
+        self._state_watches: dict[str, _Watch] = {}
+
         self._running = True
-        self._cleanup_stale_pipe_dirs()
+        self._task: asyncio.Task | None = None
 
-    def start_watching(self, session_name: str, callback: Callable) -> None:
-        """Start pipe-pane for a session. Calls callback when output arrives."""
-        if session_name in self._watches:
-            self.stop_watching(session_name)
-
-        pipe_path = self._pipe_dir / f"{session_name}.pipe"
-        # Ensure pipe dir still exists (may have been cleaned by another instance)
-        self._pipe_dir.mkdir(parents=True, exist_ok=True)
-        # Create the file so kqueue can watch it
-        pipe_path.touch()
-
-        # Start tmux pipe-pane to append output to our file
-        try:
-            subprocess.run(
-                ["tmux", "pipe-pane", "-t", session_name, "-o", f"cat >> {pipe_path}"],
-                capture_output=True,
-                timeout=5,
-            )
-        except Exception:
-            logger.debug("Failed to start pipe-pane for %s", session_name)
-            return
-
-        watch = _PaneWatch(
-            session_name=session_name,
-            pipe_path=pipe_path,
-            callback=callback,
-        )
-        self._watches[session_name] = watch
-
-        # Start async file watcher
-        try:
-            loop = asyncio.get_running_loop()
-            watch.task = loop.create_task(self._watch_pipe_file(watch))
-        except RuntimeError:
-            # No running loop — caller will need to handle fallback polling
-            logger.debug("No event loop available for file watching")
-
-    def stop_watching(self, session_name: str) -> None:
-        """Stop pipe-pane and file watching for a session."""
-        watch = self._watches.pop(session_name, None)
-        if watch is None:
-            return
-
-        # Cancel the watcher task
-        if watch.task is not None:
-            watch.task.cancel()
-
-        # Close the file descriptor
-        if watch.fd >= 0:
-            try:
-                os.close(watch.fd)
-            except OSError:
-                pass
-
-        # Disable pipe-pane
-        try:
-            subprocess.run(
-                ["tmux", "pipe-pane", "-t", session_name],
-                capture_output=True,
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-        # Clean up pipe file
-        try:
-            watch.pipe_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def start_watching_state(self, session_name: str, callback: Callable) -> None:
-        """Watch a session's state file for changes via kqueue.
-
-        The state file is written by sw-hook.sh on Claude state transitions.
-        Calls callback(session_name) when the file changes.
-        """
+        """Watch a session's state file. Calls callback(session_name) on change."""
         if session_name in self._state_watches:
             self.stop_watching_state(session_name)
 
         from super_worker.constants import SESSION_STATES_DIR
         state_file = SESSION_STATES_DIR / session_name
-
-        # Ensure the state dir and file exist so kqueue can watch
         SESSION_STATES_DIR.mkdir(parents=True, exist_ok=True)
         state_file.touch()
 
-        watch = _FileWatch(
-            path=state_file,
-            callback=callback,
-        )
-        self._state_watches[session_name] = watch
-
         try:
-            loop = asyncio.get_running_loop()
-            watch.task = loop.create_task(self._watch_state_file(watch, session_name))
-        except RuntimeError:
-            logger.debug("No event loop available for state file watching")
+            fd = os.open(str(state_file), os.O_RDONLY)
+        except OSError:
+            logger.debug("Failed to open state file: %s", state_file)
+            return
+
+        watch = _Watch(fd=fd, callback=callback, callback_arg=session_name)
+        self._register(watch)
+        with self._lock:
+            self._state_watches[session_name] = watch
 
     def stop_watching_state(self, session_name: str) -> None:
         """Stop watching a session's state file."""
-        watch = self._state_watches.pop(session_name, None)
+        with self._lock:
+            watch = self._state_watches.pop(session_name, None)
         if watch is None:
             return
+        self._unregister(watch)
 
-        if watch.task is not None:
-            watch.task.cancel()
+    def cleanup(self) -> None:
+        """Stop all watches and shut down."""
+        self._running = False
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        for name in list(self._state_watches):
+            self.stop_watching_state(name)
+        try:
+            self._kq.close()
+        except Exception:
+            pass
 
-        if watch.fd >= 0:
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _register(self, watch: _Watch) -> None:
+        """Add fd to the kqueue and start the watcher task if needed."""
+        kevent = select.kevent(
+            watch.fd,
+            filter=select.KQ_FILTER_VNODE,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+            fflags=select.KQ_NOTE_WRITE,
+        )
+        try:
+            self._kq.control([kevent], 0, 0)
+        except Exception:
             try:
                 os.close(watch.fd)
             except OSError:
                 pass
-
-    async def _watch_pipe_file(self, watch: _PaneWatch) -> None:
-        """Watch a pipe file for modifications using kqueue. Truncates after each event."""
-        try:
-            fd = os.open(str(watch.pipe_path), os.O_RDONLY)
-            watch.fd = fd
-        except OSError:
-            logger.debug("Failed to open pipe file for watching: %s", watch.pipe_path)
             return
+        with self._lock:
+            self._fd_to_watch[watch.fd] = watch
 
+        # Ensure the watcher asyncio task is running
         try:
-            kq = select.kqueue()
-            event = select.kevent(
-                fd,
-                filter=select.KQ_FILTER_VNODE,
-                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                fflags=select.KQ_NOTE_WRITE,
-            )
-            kq.control([event], 0, 0)
-
-            while self._running:
-                # Check for changes — run in thread to avoid blocking the event loop
-                events = await asyncio.to_thread(kq.control, None, 1, 0.5)
-                if events:
-                    # Truncate the pipe file to prevent unbounded growth.
-                    # The file is only a notification channel — we never read it.
-                    try:
-                        os.truncate(watch.pipe_path, 0)
-                    except OSError:
-                        pass
-
-                    try:
-                        watch.callback()
-                    except Exception:
-                        logger.debug("Pane watcher callback error", exc_info=True)
-        except asyncio.CancelledError:
+            loop = asyncio.get_running_loop()
+            if self._task is None or self._task.done():
+                self._task = loop.create_task(self._watch_loop())
+        except RuntimeError:
             pass
-        except Exception:
-            logger.debug("File watcher error for %s", watch.session_name, exc_info=True)
-        finally:
-            try:
-                kq.close()
-            except Exception:
-                pass
 
-    async def _watch_state_file(self, watch: _FileWatch, session_name: str) -> None:
-        """Watch a state file for modifications using kqueue."""
+    def _unregister(self, watch: _Watch) -> None:
+        """Remove fd from the kqueue and close it."""
+        with self._lock:
+            self._fd_to_watch.pop(watch.fd, None)
+        kevent = select.kevent(
+            watch.fd,
+            filter=select.KQ_FILTER_VNODE,
+            flags=select.KQ_EV_DELETE,
+        )
         try:
-            fd = os.open(str(watch.path), os.O_RDONLY)
-            watch.fd = fd
+            self._kq.control([kevent], 0, 0)
+        except Exception:
+            pass
+        try:
+            os.close(watch.fd)
         except OSError:
-            logger.debug("Failed to open state file for watching: %s", watch.path)
-            return
+            pass
 
+    async def _watch_loop(self) -> None:
+        """Single asyncio task: blocks on kqueue in dedicated thread, fires callbacks."""
+        loop = asyncio.get_running_loop()
         try:
-            kq = select.kqueue()
-            event = select.kevent(
-                fd,
-                filter=select.KQ_FILTER_VNODE,
-                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                fflags=select.KQ_NOTE_WRITE,
-            )
-            kq.control([event], 0, 0)
-
             while self._running:
-                events = await asyncio.to_thread(kq.control, None, 1, 0.5)
-                if events:
-                    try:
-                        watch.callback(session_name)
-                    except Exception:
-                        logger.debug("State watcher callback error", exc_info=True)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.debug("State file watcher error for %s", session_name, exc_info=True)
-        finally:
-            try:
-                kq.close()
-            except Exception:
-                pass
-
-    def cleanup(self) -> None:
-        """Stop all watches, remove temp dir."""
-        self._running = False
-        for name in list(self._watches):
-            self.stop_watching(name)
-        for name in list(self._state_watches):
-            self.stop_watching_state(name)
-        PaneWatcher._active_pipe_dirs.discard(self._pipe_dir)
-        import shutil
-        try:
-            shutil.rmtree(self._pipe_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-    def _cleanup_stale_pipe_dirs(self) -> None:
-        """Remove leftover sw-pipes-* dirs from previous runs."""
-        import shutil
-        tmp = self._pipe_dir.parent
-        for d in tmp.iterdir():
-            if d.is_dir() and d.name.startswith("sw-pipes-") and d not in PaneWatcher._active_pipe_dirs:
                 try:
-                    shutil.rmtree(d, ignore_errors=True)
+                    events = await loop.run_in_executor(
+                        _KQUEUE_EXECUTOR, self._kq.control, None, 32, 0.5
+                    )
                 except Exception:
-                    pass
+                    if self._running:
+                        logger.debug("kqueue error in watch loop", exc_info=True)
+                    break
+
+                for event in events:
+                    fd = event.ident
+                    with self._lock:
+                        watch = self._fd_to_watch.get(fd)
+                    if watch is None:
+                        continue
+                    try:
+                        watch.callback(watch.callback_arg)
+                    except Exception:
+                        logger.debug("kqueue callback error", exc_info=True)
+        except asyncio.CancelledError:
+            pass

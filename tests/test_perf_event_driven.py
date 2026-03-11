@@ -12,7 +12,6 @@ Covers:
 
 import inspect
 import os
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -97,28 +96,6 @@ class TestCleanupStateFile:
     def test_cleanup_nonexistent(self, state_dir):
         # Should not raise
         cleanup_state_file("sw-nonexistent-0")
-
-
-class TestPaneWatcherTruncation:
-    """Test that pipe files are truncated after kqueue events."""
-
-    def test_pipe_file_truncated_after_callback(self):
-        """Verify the truncation call exists in _watch_pipe_file logic."""
-        from super_worker.services.pane_watcher import PaneWatcher
-
-        watcher = PaneWatcher()
-        try:
-            # Create a fake pipe file and write data to it
-            pipe_path = watcher._pipe_dir / "test.pipe"
-            pipe_path.write_text("x" * 10000)
-            assert pipe_path.stat().st_size == 10000
-
-            # Simulate what _watch_pipe_file does after kqueue event:
-            # truncate the file
-            os.truncate(pipe_path, 0)
-            assert pipe_path.stat().st_size == 0
-        finally:
-            watcher.cleanup()
 
 
 class TestPaneWatcherStateWatching:
@@ -330,17 +307,19 @@ class TestSendKeysNoEnvSet:
 
 
 class TestFallbackPollInterval:
-    """Verify fallback poll interval is no longer aggressive."""
+    """Verify fallback poll interval is fast enough for responsive typing display."""
 
-    def test_fallback_poll_is_safety_net(self):
+    def test_fallback_poll_fast_enough_for_typing(self):
         from super_worker.constants import PANE_FALLBACK_POLL_S
-        # Should be >= 2s — kqueue handles real-time, this is just safety net
-        assert PANE_FALLBACK_POLL_S >= 2.0
+        # set_interval fires its callback directly (bypasses message queue),
+        # so the fallback poll IS what updates the display during typing.
+        # Must be <= 500ms to feel responsive.
+        assert PANE_FALLBACK_POLL_S <= 0.5
 
-    def test_fallback_poll_not_aggressive(self):
+    def test_fallback_poll_not_too_aggressive(self):
         from super_worker.constants import PANE_FALLBACK_POLL_S
-        # Should not be the old 0.3s aggressive poll
-        assert PANE_FALLBACK_POLL_S != 0.3
+        # Should not be sub-50ms (excessive tmux subprocess calls)
+        assert PANE_FALLBACK_POLL_S >= 0.05
 
 
 class TestPeriodicRefreshLightweight:
@@ -362,15 +341,7 @@ class TestPeriodicRefreshLightweight:
 
 
 class TestDebounceUsesCallLater:
-    """Verify the render debounce uses call_later with time-based throttle."""
-
-    def test_debounce_uses_call_later_not_set_timer(self):
-        """_on_pane_output should use call_later for immediate scheduling."""
-        import super_worker.widgets.terminal_pane as tp_mod
-        source = inspect.getsource(tp_mod.TerminalPane._on_pane_output)
-        assert "call_later" in source
-        # Time-based debounce via monotonic comparison
-        assert "_last_render_request" in source
+    """Verify send-keys workers are not exclusive (would drop keys)."""
 
     def test_send_keys_not_exclusive(self):
         """send-keys workers should NOT be exclusive (would drop keys)."""
@@ -445,56 +416,80 @@ async def test_rapid_typing_all_keys_sent(mock_tmux):
 
 @pytest.mark.asyncio
 async def test_display_updates_during_typing(mock_tmux):
-    """Display must update DURING typing, not just after."""
+    """Display must update DURING typing via the fallback set_interval timer."""
     from textual.app import App, ComposeResult
-    from textual.widgets import Static
     from super_worker.widgets.terminal_pane import TerminalPane
 
     _, _, mock_pane = mock_tmux
-    update_count = 0
-    original_update = Static.update
+    poll_count = 0
 
-    def tracking_update(self, *args, **kwargs):
-        nonlocal update_count
-        update_count += 1
-        return original_update(self, *args, **kwargs)
+    class TrackingTerminalPane(TerminalPane):
+        def _poll_pane(self) -> None:
+            nonlocal poll_count
+            poll_count += 1
+            super()._poll_pane()
 
     class TestApp(App):
         def compose(self) -> ComposeResult:
-            yield TerminalPane()
+            yield TrackingTerminalPane()
 
     app = TestApp()
     async with app.run_test() as pilot:
-        terminal = app.query_one(TerminalPane)
+        terminal = app.query_one(TrackingTerminalPane)
         terminal.active_session = "sw-test-0"
         await pilot.pause(delay=0.2)  # Let initial capture happen
 
         # Reset count after initial render
-        update_count = 0
-        # Patch Static.update to track widget updates
-        Static.update = tracking_update
+        poll_count = 0
 
-        try:
-            # Simulate kqueue events during typing (as pipe-pane would trigger)
-            # Each call simulates what happens when tmux writes to the pipe file
-            for i in range(10):
-                # Change capture output so hash changes and render happens
-                mock_pane.capture_pane.return_value = [f"output after key {i}"]
-                terminal._on_pane_output()
-                await pilot.pause(delay=0.1)  # Wait for debounce to fire
+        # Wait 1 second — fallback set_interval(0.15s) bypasses message queue,
+        # so it fires even during heavy key event traffic.
+        await pilot.pause(delay=1.0)
 
-            # Should have had multiple renders during the sequence, not just one at end
-            assert update_count >= 3, (
-                f"Expected >=3 renders during typing, got {update_count}. "
-                f"Display is starving during typing."
-            )
-        finally:
-            Static.update = original_update
+        # With 150ms interval, should see ~6 polls in 1 second (>=3 minimum)
+        assert poll_count >= 3, (
+            f"Expected >=3 polls during 1s, got {poll_count}. "
+            f"Display is not updating during typing."
+        )
 
 
 @pytest.mark.asyncio
-async def test_debounce_coalesces_burst_events(mock_tmux):
-    """Multiple kqueue events within one debounce window produce only one render."""
+async def test_fallback_timer_fires_independently_of_message_queue(mock_tmux):
+    """set_interval-based timer fires even when message queue is busy."""
+    from textual.app import App, ComposeResult
+    from super_worker.widgets.terminal_pane import TerminalPane
+
+    _, _, mock_pane = mock_tmux
+    poll_count = 0
+
+    class TrackingTerminalPane(TerminalPane):
+        def _poll_pane(self) -> None:
+            nonlocal poll_count
+            poll_count += 1
+            super()._poll_pane()
+
+    class TestApp(App):
+        def compose(self) -> ComposeResult:
+            yield TrackingTerminalPane()
+
+    app = TestApp()
+    async with app.run_test() as pilot:
+        terminal = app.query_one(TrackingTerminalPane)
+        terminal.active_session = "sw-test-0"
+        await pilot.pause(delay=0.2)
+        poll_count = 0
+
+        # Simulate 800ms of activity; timer fires every 150ms regardless
+        await pilot.pause(delay=0.8)
+
+        assert poll_count >= 4, (
+            f"Expected >=4 polls in 800ms (150ms interval), got {poll_count}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_fallback_timer_pauses_and_resumes(mock_tmux):
+    """pause_watching stops the timer; resume_watching restarts it."""
     from textual.app import App, ComposeResult
     from super_worker.widgets.terminal_pane import TerminalPane
 
@@ -517,64 +512,12 @@ async def test_debounce_coalesces_burst_events(mock_tmux):
         terminal.active_session = "sw-test-0"
         await pilot.pause(delay=0.2)
 
-        # Reset count after initial activity
-        poll_count = 0
-
-        # Fire 5 rapid kqueue events within one debounce window (~50ms)
-        for _ in range(5):
-            terminal._on_pane_output()
-        # Wait for trailing timer + processing
-        await pilot.pause(delay=0.2)
-
-        # Time-based debounce: first event triggers call_later (immediate),
-        # remaining events are throttled, trailing timer fires once.
-        # Should produce at most 2 polls (1 immediate + 1 trailing), not 5.
-        assert poll_count <= 2, (
-            f"Expected <=2 coalesced polls from 5 rapid events, got {poll_count}"
-        )
-
-
-@pytest.mark.asyncio
-async def test_debounce_allows_periodic_renders_during_sustained_input(mock_tmux):
-    """During sustained typing, renders happen periodically (not starved)."""
-    from textual.app import App, ComposeResult
-    from super_worker.widgets.terminal_pane import TerminalPane
-
-    _, _, mock_pane = mock_tmux
-    poll_count = 0
-
-    class TrackingTerminalPane(TerminalPane):
-        def _poll_pane(self) -> None:
-            nonlocal poll_count
-            poll_count += 1
-            super()._poll_pane()
-
-    class TestApp(App):
-        def compose(self) -> ComposeResult:
-            yield TrackingTerminalPane()
-
-    app = TestApp()
-    async with app.run_test() as pilot:
-        terminal = app.query_one(TrackingTerminalPane)
-        terminal.active_session = "sw-test-0"
-        await pilot.pause(delay=0.2)
+        terminal.pause_watching()
+        assert terminal._fallback_timer is None, "Timer should be stopped after pause_watching"
 
         poll_count = 0
+        await pilot.pause(delay=0.4)
+        assert poll_count == 0, f"Timer fired after pause_watching, got {poll_count} polls"
 
-        # Simulate sustained typing: kqueue event every 80ms for 800ms
-        # With 50ms debounce that doesn't reset, should get ~10 renders
-        for i in range(10):
-            terminal._on_pane_output()
-            await pilot.pause(delay=0.08)
-
-        # Wait for last debounce to fire
-        await pilot.pause(delay=0.2)
-
-        # With non-resetting debounce: each event that finds no pending timer
-        # starts one.  Timer fires after 50ms, clears itself, next event
-        # starts a new timer.  With 80ms spacing and 50ms debounce, most
-        # events should trigger their own render.
-        assert poll_count >= 5, (
-            f"Expected >=5 renders during 800ms of typing, got {poll_count}. "
-            f"Debounce is starving renders during sustained input."
-        )
+        terminal.resume_watching()
+        assert terminal._fallback_timer is not None, "Timer should restart after resume_watching"

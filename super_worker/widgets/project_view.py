@@ -41,6 +41,7 @@ from super_worker.services.tmux import (
     open_external_terminal,
     read_all_state_files,
     read_state_file,
+    verify_waiting_approval,
 )
 from super_worker.services.worktree import (
     BranchExistsError,
@@ -217,6 +218,14 @@ class ProjectView(Widget):
             pass
 
     def _set_active_worktree(self, wt: Worktree) -> None:
+        # Pause the old worktree's terminal captures (keeps content + state watches)
+        old_wt = self._active_worktree
+        if old_wt and old_wt.name != wt.name:
+            try:
+                old_wtc = self.query_one(f"#wtc-{old_wt.name}", WorktreeTabContent)
+                old_wtc.query_one(TerminalPane).pause_watching()
+            except Exception:
+                pass
         self._active_worktree = wt
         if wt.sessions:
             first = wt.sessions[0]
@@ -236,6 +245,7 @@ class ProjectView(Widget):
                 wtc.query_one(SessionSidebar).select_session(tmux_session_name)
                 terminal = wtc.query_one(TerminalPane)
                 terminal.active_session = tmux_session_name
+                terminal.resume_watching()
                 terminal.focus()
             except Exception:
                 pass
@@ -630,6 +640,15 @@ class ProjectView(Widget):
                 else:
                     new_cache[name] = file_states.get(name, SessionState.UNKNOWN)
             self._cached_session_states = new_cache
+
+            # Cross-check sessions showing waiting_approval — state files can
+            # be stale for sessions started before the latest hook was installed.
+            suspect = [n for n, s in new_cache.items() if s == SessionState.WAITING_APPROVAL]
+            if suspect:
+                corrections = await asyncio.to_thread(verify_waiting_approval, suspect)
+                for name, real_state in corrections.items():
+                    self._cached_session_states[name] = real_state
+
             new_attention = has_waiting_approval(self._cached_session_states)
             if old_attention != new_attention:
                 self.post_message(self.AttentionChanged(
