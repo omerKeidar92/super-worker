@@ -70,6 +70,76 @@ _STATE_MAP = {
 }
 
 
+def read_state_file(session_name: str) -> SessionState:
+    """Read session state from file written by sw-hook.sh. No subprocess calls."""
+    from super_worker.constants import SESSION_STATES_DIR
+    state_file = SESSION_STATES_DIR / session_name
+    try:
+        value = state_file.read_text().strip()
+        return _STATE_MAP.get(value, SessionState.UNKNOWN)
+    except (OSError, ValueError):
+        return SessionState.UNKNOWN
+
+
+def read_all_state_files(session_names: list[str]) -> dict[str, SessionState]:
+    """Read state files for multiple sessions. No subprocess calls.
+
+    Falls back to UNKNOWN for sessions without state files (e.g. terminals).
+    Does NOT detect dead sessions — callers should use batch_detect_session_states
+    for that (e.g. on periodic refresh).
+    """
+    from super_worker.constants import SESSION_STATES_DIR
+    results: dict[str, SessionState] = {}
+    for name in session_names:
+        state_file = SESSION_STATES_DIR / name
+        try:
+            value = state_file.read_text().strip()
+            results[name] = _STATE_MAP.get(value, SessionState.UNKNOWN)
+        except (OSError, ValueError):
+            results[name] = SessionState.UNKNOWN
+    return results
+
+
+def batch_check_alive(session_names: list[str]) -> set[str]:
+    """Return the set of session names that are dead or missing.
+
+    Lightweight alternative to batch_detect_session_states — checks only
+    whether sessions exist and their pane is alive.  No show_environment
+    calls, so this is a single ``tmux list-sessions`` plus one attribute
+    read per session.
+    """
+    if not session_names:
+        return set()
+
+    server = _get_server()
+    try:
+        live_sessions = {s.session_name: s for s in server.sessions}
+    except Exception:
+        return set()
+
+    dead: set[str] = set()
+    for name in session_names:
+        if name not in live_sessions:
+            dead.add(name)
+            continue
+        try:
+            pane = live_sessions[name].active_pane
+            if pane and getattr(pane, "pane_dead", None) == "1":
+                dead.add(name)
+        except Exception:
+            pass
+    return dead
+
+
+def cleanup_state_file(session_name: str) -> None:
+    """Remove the state file for a session (called on session deletion)."""
+    from super_worker.constants import SESSION_STATES_DIR
+    try:
+        (SESSION_STATES_DIR / session_name).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def tmux_session_name(worktree_name: str, index: int) -> str:
     return f"{TMUX_SESSION_PREFIX}-{worktree_name}-{index}"
 
@@ -86,14 +156,6 @@ def _find_available_session_name(worktree: Worktree) -> str:
         index += 1
     raise RuntimeError(f"Could not find available session name for worktree '{worktree.name}'")
 
-
-def _set_session_env(session_name: str, key: str, value: str) -> None:
-    """Set a tmux environment variable on a session."""
-    try:
-        session = _get_server().sessions.get(session_name=session_name)
-        session.set_environment(key, value)
-    except Exception:
-        logger.debug("Failed to set env %s on session %s", key, session_name)
 
 
 def build_process_cmd(
@@ -176,10 +238,6 @@ def capture_pane(tmux_session_name: str) -> str:
         return f"[Session {tmux_session_name} not found]"
 
 
-_last_state_set: dict[str, float] = {}
-_STATE_SET_THROTTLE_S = 1.0
-
-
 def send_keys(tmux_session_name: str, *keys: str, literal: bool = False) -> None:
     """Send keystrokes to a tmux session."""
     pane = _get_pane(tmux_session_name)
@@ -189,11 +247,6 @@ def send_keys(tmux_session_name: str, *keys: str, literal: bool = False) -> None
     try:
         for key in keys:
             pane.send_keys(key, enter=False, literal=literal)
-        # Mark session as running (throttled to avoid 6ms overhead per keystroke)
-        now = time.monotonic()
-        if now - _last_state_set.get(tmux_session_name, 0) >= _STATE_SET_THROTTLE_S:
-            _set_session_env(tmux_session_name, "SW_CC_STATE", "running")
-            _last_state_set[tmux_session_name] = now
     except Exception:
         invalidate_pane_cache(tmux_session_name)
         logger.debug("Failed to send keys to tmux session", extra={"session": tmux_session_name})

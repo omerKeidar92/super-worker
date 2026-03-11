@@ -7,7 +7,7 @@ import shutil
 import stat
 from pathlib import Path
 
-from super_worker.constants import STATE_DIR
+from super_worker.constants import SESSION_STATES_DIR, STATE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,7 @@ def install_hooks() -> None:
     """
     # 1. Copy hook script from package to ~/.config/sw/
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_STATES_DIR.mkdir(parents=True, exist_ok=True)
     source = _get_hook_source()
     if source:
         shutil.copy2(source, _HOOK_DEST)

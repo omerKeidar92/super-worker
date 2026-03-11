@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Super Worker hook for Claude Code state detection.
 # Called by Claude Code's hook system with the desired state as $1.
-# Sets SW_CC_STATE on the tmux session so the TUI can detect Claude's state.
+# Sets SW_CC_STATE on the tmux session and writes a state file so the TUI
+# can detect changes via kqueue without polling subprocess calls.
 
 set -euo pipefail
 
@@ -24,7 +25,12 @@ if command -v tmux &>/dev/null && tmux has-session -t "$SW_SESSION_NAME" 2>/dev/
         esac
         tmux select-pane -t "$TMUX_PANE" -T "${ICON} ${SW_PANE_LABEL:-session} [${SW_PANE_TYPE:-CC}]"
     else
-        # TUI mode: per-session state (unchanged)
+        # TUI mode: per-session state via tmux env (legacy, kept for compatibility)
         tmux setenv -t "$SW_SESSION_NAME" SW_CC_STATE "$STATE"
     fi
+
+    # Write state to file for kqueue-based detection (both modes)
+    STATE_DIR="${HOME}/.config/sw/session-states"
+    mkdir -p "$STATE_DIR"
+    printf '%s' "$STATE" > "${STATE_DIR}/${SW_SESSION_NAME}"
 fi

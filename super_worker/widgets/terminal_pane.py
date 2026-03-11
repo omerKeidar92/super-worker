@@ -38,9 +38,12 @@ class TerminalPane(Widget, can_focus=True):
     press Ctrl+A to attach directly to the tmux session.
     """
 
-    class ContentChanged(Message):
-        """Posted when captured pane content has changed."""
-        pass
+    class StateChanged(Message):
+        """Posted when a session's state changes (detected via kqueue on state file)."""
+
+        def __init__(self, session_name: str) -> None:
+            self.session_name = session_name
+            super().__init__()
 
     active_session: reactive[str | None] = reactive(None)
 
@@ -72,6 +75,7 @@ class TerminalPane(Widget, can_focus=True):
         self._render_timer = None
         self._last_successful_render: float = 0.0
         self._watcher = PaneWatcher()
+        self._watched_state_sessions: set[str] = set()
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="terminal-scroll"):
@@ -105,14 +109,36 @@ class TerminalPane(Widget, can_focus=True):
             self._poll_pane()  # Initial capture
             self._fallback_timer = self.set_interval(PANE_FALLBACK_POLL_S, self._poll_pane)
 
+    def start_watching_states(self, session_names: list[str]) -> None:
+        """Start watching state files for all given sessions.
+
+        Adds new watches and removes stale ones. Safe to call repeatedly.
+        """
+        new_set = set(session_names)
+        # Stop watching sessions no longer in the list
+        for name in self._watched_state_sessions - new_set:
+            self._watcher.stop_watching_state(name)
+        # Start watching new sessions
+        for name in new_set - self._watched_state_sessions:
+            self._watcher.start_watching_state(name, self._on_state_changed)
+        self._watched_state_sessions = new_set
+
+    def _on_state_changed(self, session_name: str) -> None:
+        """Called by kqueue watcher when a session's state file changes."""
+        try:
+            self.post_message(self.StateChanged(session_name))
+        except Exception:
+            pass
+
     def _on_pane_output(self) -> None:
         """Called by PaneWatcher when pipe-pane file has new data."""
         try:
-            # Debounce: coalesce rapid kqueue events (e.g. during typing) into
-            # a single capture+render.  Without this, every keystroke triggers a
-            # full 500-line ANSI parse + widget re-layout.
+            # Coalesce rapid kqueue events into periodic renders.
+            # If a timer is already pending, let it fire — don't reset it.
+            # This gives ~20 renders/sec during typing (1/RENDER_DEBOUNCE_S)
+            # instead of starving until typing stops.
             if self._render_timer is not None:
-                self._render_timer.stop()
+                return  # Timer already pending, will fire soon
             self._render_timer = self.set_timer(
                 _RENDER_DEBOUNCE_S, self._debounced_poll
             )
@@ -150,7 +176,6 @@ class TerminalPane(Widget, can_focus=True):
         self._last_successful_render = time.monotonic()
         try:
             self.query_one("#terminal-content", Static).update(event.worker.result[1])
-            self.post_message(self.ContentChanged())
         except Exception:
             logger.debug("terminal-content widget not available during pane update", exc_info=True)
 
