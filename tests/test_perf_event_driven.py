@@ -361,16 +361,16 @@ class TestPeriodicRefreshLightweight:
         assert "read_all_state_files" in source
 
 
-class TestDebounceDoesNotReset:
-    """Verify the render debounce doesn't reset — lets pending timers fire."""
+class TestDebounceUsesCallLater:
+    """Verify the render debounce uses call_later with time-based throttle."""
 
-    def test_debounce_returns_early_if_timer_pending(self):
-        """_on_pane_output should return early if _render_timer is not None."""
+    def test_debounce_uses_call_later_not_set_timer(self):
+        """_on_pane_output should use call_later for immediate scheduling."""
         import super_worker.widgets.terminal_pane as tp_mod
         source = inspect.getsource(tp_mod.TerminalPane._on_pane_output)
-        # Should check for existing timer and return, not stop+recreate
-        assert "return" in source
-        assert ".stop()" not in source
+        assert "call_later" in source
+        # Time-based debounce via monotonic comparison
+        assert "_last_render_request" in source
 
     def test_send_keys_not_exclusive(self):
         """send-keys workers should NOT be exclusive (would drop keys)."""
@@ -523,12 +523,14 @@ async def test_debounce_coalesces_burst_events(mock_tmux):
         # Fire 5 rapid kqueue events within one debounce window (~50ms)
         for _ in range(5):
             terminal._on_pane_output()
-        # Wait for the single debounced poll to fire
+        # Wait for trailing timer + processing
         await pilot.pause(delay=0.2)
 
-        # Should have coalesced into exactly 1 poll, not 5
-        assert poll_count == 1, (
-            f"Expected 1 coalesced poll from 5 rapid events, got {poll_count}"
+        # Time-based debounce: first event triggers call_later (immediate),
+        # remaining events are throttled, trailing timer fires once.
+        # Should produce at most 2 polls (1 immediate + 1 trailing), not 5.
+        assert poll_count <= 2, (
+            f"Expected <=2 coalesced polls from 5 rapid events, got {poll_count}"
         )
 
 

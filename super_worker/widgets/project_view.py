@@ -256,9 +256,14 @@ class ProjectView(Widget):
         old_state = self._cached_session_states.get(name)
         if new_state == old_state:
             return
-        old_attention = has_waiting_approval(self._cached_session_states)
+        # Scope attention check to current sessions only — stale cache entries
+        # for deleted sessions could keep the bell icon on indefinitely.
+        current_names = {s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions}
+        current_states = {k: v for k, v in self._cached_session_states.items() if k in current_names}
+        old_attention = has_waiting_approval(current_states)
         self._cached_session_states[name] = new_state
-        new_attention = has_waiting_approval(self._cached_session_states)
+        current_states[name] = new_state
+        new_attention = has_waiting_approval(current_states)
         if old_attention != new_attention:
             self.post_message(self.AttentionChanged(
                 str(self._config.repo_root), new_attention
@@ -616,11 +621,15 @@ class ProjectView(Widget):
             file_states = read_all_state_files(all_session_names)
 
             old_attention = has_waiting_approval(self._cached_session_states)
+            # Rebuild cache from current sessions only — prune stale entries
+            # for deleted sessions whose last state might have been waiting_approval.
+            new_cache: dict[str, SessionState] = {}
             for name in all_session_names:
                 if name in dead_names:
-                    self._cached_session_states[name] = SessionState.DEAD
+                    new_cache[name] = SessionState.DEAD
                 else:
-                    self._cached_session_states[name] = file_states.get(name, SessionState.UNKNOWN)
+                    new_cache[name] = file_states.get(name, SessionState.UNKNOWN)
+            self._cached_session_states = new_cache
             new_attention = has_waiting_approval(self._cached_session_states)
             if old_attention != new_attention:
                 self.post_message(self.AttentionChanged(
