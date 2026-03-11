@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # Super Worker hook for Claude Code state detection.
 # Called by Claude Code's hook system with the desired state as $1.
-# Sets SW_CC_STATE on the tmux session and writes a state file so the TUI
-# can detect changes via kqueue without polling subprocess calls.
+# Writes a state file so the TUI can detect changes via kqueue.
+# Skips redundant writes to avoid ~19ms overhead per tool call.
 
 set -euo pipefail
 
 STATE="${1:-}"
 if [ -z "$STATE" ] || [ -z "${SW_SESSION_NAME:-}" ]; then
+    exit 0
+fi
+
+# Skip redundant state writes — state file is the source of truth.
+# This avoids ~19ms of tmux subprocess overhead on every PreToolUse
+# when Claude is already in "running" state.
+STATE_DIR="${HOME}/.config/sw/session-states"
+STATE_FILE="${STATE_DIR}/${SW_SESSION_NAME}"
+if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE" 2>/dev/null)" = "$STATE" ]; then
     exit 0
 fi
 
@@ -30,7 +39,6 @@ if command -v tmux &>/dev/null && tmux has-session -t "$SW_SESSION_NAME" 2>/dev/
     fi
 
     # Write state to file for kqueue-based detection (both modes)
-    STATE_DIR="${HOME}/.config/sw/session-states"
     mkdir -p "$STATE_DIR"
-    printf '%s' "$STATE" > "${STATE_DIR}/${SW_SESSION_NAME}"
+    printf '%s' "$STATE" > "$STATE_FILE"
 fi
