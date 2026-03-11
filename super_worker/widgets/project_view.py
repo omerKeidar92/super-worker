@@ -30,13 +30,17 @@ from super_worker.services.state import (
 )
 from super_worker.services.tmux import (
     SessionState,
+    batch_check_alive,
     batch_detect_session_states,
+    cleanup_state_file,
     create_session,
     enable_mouse,
     has_waiting_approval,
     kill_all_sessions,
     kill_session,
     open_external_terminal,
+    read_all_state_files,
+    read_state_file,
 )
 from super_worker.services.worktree import (
     BranchExistsError,
@@ -171,6 +175,7 @@ class ProjectView(Widget):
             async def _initial_refresh():
                 await self._refresh_sidebar(wt)
                 self._set_active_worktree(wt)
+                self._start_state_watching()
 
             self.run_worker(_initial_refresh, exclusive=False)
 
@@ -191,6 +196,23 @@ class ProjectView(Widget):
                 self.app.sub_title = f"{base} · {session_label}"
             else:
                 self.app.sub_title = base
+        except Exception:
+            pass
+
+    def _start_state_watching(self) -> None:
+        """Start kqueue watches on state files for ALL sessions in this project.
+
+        Called once on mount and whenever sessions change. The active worktree's
+        TerminalPane hosts the watchers for all sessions across all worktrees,
+        so attention indicators update instantly for the entire project.
+        """
+        all_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
+        if not all_names or not self._active_worktree:
+            return
+        try:
+            wtc = self.query_one(f"#wtc-{self._active_worktree.name}", WorktreeTabContent)
+            terminal = wtc.query_one(TerminalPane)
+            terminal.start_watching_states(all_names)
         except Exception:
             pass
 
@@ -227,19 +249,15 @@ class ProjectView(Widget):
             if wt:
                 self._set_active_worktree(wt)
 
-    def on_terminal_pane_content_changed(self, event: TerminalPane.ContentChanged) -> None:
-        """Pane output changed — check all session states so indicators update fast."""
-        all_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
-        if all_names:
-            self.run_worker(self._check_all_states(all_names), exclusive=False)
-
-    async def _check_all_states(self, session_names: list[str]) -> None:
-        """Check all session states in background thread; update UI only on change."""
-        states = await asyncio.to_thread(batch_detect_session_states, session_names)
-        if states == {k: self._cached_session_states.get(k) for k in states}:
+    def on_terminal_pane_state_changed(self, event: TerminalPane.StateChanged) -> None:
+        """Session state changed (via kqueue on state file) — update UI instantly."""
+        name = event.session_name
+        new_state = read_state_file(name)
+        old_state = self._cached_session_states.get(name)
+        if new_state == old_state:
             return
         old_attention = has_waiting_approval(self._cached_session_states)
-        self._cached_session_states.update(states)
+        self._cached_session_states[name] = new_state
         new_attention = has_waiting_approval(self._cached_session_states)
         if old_attention != new_attention:
             self.post_message(self.AttentionChanged(
@@ -306,6 +324,8 @@ class ProjectView(Widget):
 
         self.app.notify(f"Deleted session: {session.label}")
         await asyncio.to_thread(kill_session, tmux_name)
+        cleanup_state_file(tmux_name)
+        self._start_state_watching()  # Update watch list
         await asyncio.to_thread(save_state, self._state, self._config)
 
     def on_git_action(self, event: GitAction) -> None:
@@ -370,6 +390,7 @@ class ProjectView(Widget):
                 wt.sessions.append(session)
             await asyncio.to_thread(save_state, self._state, self._config)
             await self._add_worktree_tab(wt)
+            self._start_state_watching()  # Watch new worktree's sessions
             self.app.notify(f"Created worktree: {name}")
 
         self.run_worker(_create, exclusive=False)
@@ -415,6 +436,7 @@ class ProjectView(Widget):
                 self._active_session_name = session.tmux_session_name
                 await self._refresh_sidebar(wt)
                 self._activate_terminal(wt.name, session.tmux_session_name)
+                self._start_state_watching()  # Watch new session's state file
                 self.app.notify(f"Created session: {session.label}")
 
             self.run_worker(_create_session, exclusive=False)
@@ -561,11 +583,14 @@ class ProjectView(Widget):
     # ── Periodic refresh ──────────────────────────────────────────────────────
 
     async def check_attention(self) -> None:
-        """Lightweight state-only check for non-active projects."""
+        """Lightweight state-only check for non-active projects.
+
+        Reads state files (no subprocess calls) for instant attention detection.
+        """
         old_attention = has_waiting_approval(self._cached_session_states)
         all_session_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
         if all_session_names:
-            self._cached_session_states = await asyncio.to_thread(batch_detect_session_states, all_session_names)
+            self._cached_session_states = read_all_state_files(all_session_names)
         else:
             self._cached_session_states = {}
         new_attention = has_waiting_approval(self._cached_session_states)
@@ -575,18 +600,32 @@ class ProjectView(Widget):
             ))
 
     async def periodic_refresh(self) -> None:
-        """Fetch all blocking data in threads, then update UI. Called by app timer."""
-        old_attention = has_waiting_approval(self._cached_session_states)
+        """Fetch git data and detect dead sessions. Called by app timer.
+
+        State detection is event-driven via kqueue on state files (see
+        on_terminal_pane_state_changed). This method only handles:
+        - Git status (no event source, must poll)
+        - Dead session detection (lightweight alive check, no show_environment)
+        - Syncing state cache from state files for sessions without kqueue watches
+        """
         all_session_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
         if all_session_names:
-            self._cached_session_states = await asyncio.to_thread(batch_detect_session_states, all_session_names)
-        else:
-            self._cached_session_states = {}
-        new_attention = has_waiting_approval(self._cached_session_states)
-        if old_attention != new_attention:
-            self.post_message(self.AttentionChanged(
-                str(self._config.repo_root), new_attention
-            ))
+            # Lightweight: single list-sessions + pane_dead check (no show_environment)
+            dead_names = await asyncio.to_thread(batch_check_alive, all_session_names)
+            # Read state from files (no subprocess) for live sessions
+            file_states = read_all_state_files(all_session_names)
+
+            old_attention = has_waiting_approval(self._cached_session_states)
+            for name in all_session_names:
+                if name in dead_names:
+                    self._cached_session_states[name] = SessionState.DEAD
+                else:
+                    self._cached_session_states[name] = file_states.get(name, SessionState.UNKNOWN)
+            new_attention = has_waiting_approval(self._cached_session_states)
+            if old_attention != new_attention:
+                self.post_message(self.AttentionChanged(
+                    str(self._config.repo_root), new_attention
+                ))
 
         git_data: dict[str, tuple[dict, bool]] = {}
         if self._state.worktrees:

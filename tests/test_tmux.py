@@ -6,7 +6,7 @@ from super_worker.models import Session, Worktree
 from super_worker.services.tmux import (
     SessionState,
     _find_available_session_name,
-    _set_session_env,
+    batch_check_alive,
     batch_detect_session_states,
     capture_pane,
     create_session,
@@ -181,18 +181,6 @@ def test_kill_all_sessions(monkeypatch):
     assert killed == ["sw-feat-0", "sw-feat-1"]
 
 
-class TestSetSessionEnv:
-    def test_sets_env_var(self, monkeypatch):
-        mock_server, mock_session, _ = _mock_server(monkeypatch)
-        _set_session_env("sw-feat-0", "SW_CC_STATE", "running")
-        mock_session.set_environment.assert_called_once_with("SW_CC_STATE", "running")
-
-    def test_handles_missing_session(self, monkeypatch):
-        mock_server = MagicMock()
-        mock_server.sessions.get.side_effect = Exception("not found")
-        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
-        _set_session_env("sw-dead-0", "SW_CC_STATE", "running")  # Should not raise
-
 
 class TestIsSessionAlive:
     def test_alive_session(self, monkeypatch):
@@ -229,6 +217,79 @@ class TestBatchDetectDeadPanes:
 
         result = batch_detect_session_states(["sw-a-0"])
         assert result["sw-a-0"] == SessionState.DEAD
+
+
+class TestBatchCheckAlive:
+    """Tests for batch_check_alive — lightweight dead detection without show_environment."""
+
+    def _mock_alive(self, monkeypatch, sessions: list):
+        mock_server = MagicMock()
+        mock_server.sessions = sessions
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+
+    def test_empty_input(self):
+        assert batch_check_alive([]) == set()
+
+    def test_all_alive(self, monkeypatch):
+        s1 = MagicMock()
+        s1.session_name = "sw-a-0"
+        s1.active_pane.pane_dead = "0"
+        s2 = MagicMock()
+        s2.session_name = "sw-b-0"
+        s2.active_pane.pane_dead = "0"
+        self._mock_alive(monkeypatch, [s1, s2])
+
+        dead = batch_check_alive(["sw-a-0", "sw-b-0"])
+        assert dead == set()
+
+    def test_missing_session(self, monkeypatch):
+        self._mock_alive(monkeypatch, [])
+
+        dead = batch_check_alive(["sw-missing-0"])
+        assert dead == {"sw-missing-0"}
+
+    def test_dead_pane(self, monkeypatch):
+        s1 = MagicMock()
+        s1.session_name = "sw-a-0"
+        dead_pane = MagicMock()
+        dead_pane.pane_dead = "1"
+        s1.active_pane = dead_pane
+        self._mock_alive(monkeypatch, [s1])
+
+        dead = batch_check_alive(["sw-a-0"])
+        assert dead == {"sw-a-0"}
+
+    def test_mixed_alive_dead_missing(self, monkeypatch):
+        alive = MagicMock()
+        alive.session_name = "sw-alive-0"
+        alive.active_pane.pane_dead = "0"
+        dead = MagicMock()
+        dead.session_name = "sw-dead-0"
+        dead_pane = MagicMock()
+        dead_pane.pane_dead = "1"
+        dead.active_pane = dead_pane
+        self._mock_alive(monkeypatch, [alive, dead])
+
+        result = batch_check_alive(["sw-alive-0", "sw-dead-0", "sw-missing-0"])
+        assert result == {"sw-dead-0", "sw-missing-0"}
+
+    def test_server_failure_returns_empty(self, monkeypatch):
+        mock_server = MagicMock()
+        mock_server.sessions.__iter__ = MagicMock(side_effect=Exception("tmux not running"))
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
+
+        dead = batch_check_alive(["sw-a-0"])
+        assert dead == set()
+
+    def test_does_not_call_show_environment(self, monkeypatch):
+        """batch_check_alive should never call show_environment (that's the whole point)."""
+        s1 = MagicMock()
+        s1.session_name = "sw-a-0"
+        s1.active_pane.pane_dead = "0"
+        self._mock_alive(monkeypatch, [s1])
+
+        batch_check_alive(["sw-a-0"])
+        s1.show_environment.assert_not_called()
 
 
 class TestRespawnPane:

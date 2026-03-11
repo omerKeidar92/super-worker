@@ -1,4 +1,4 @@
-"""Watch tmux pane output via pipe-pane and kqueue for efficient terminal updates."""
+"""Watch tmux pane output and session state files via kqueue for efficient updates."""
 
 import asyncio
 import logging
@@ -24,6 +24,16 @@ class _PaneWatch:
     fd: int = -1
 
 
+@dataclass
+class _FileWatch:
+    """State for a watched file (used for state files)."""
+
+    path: Path
+    callback: Callable
+    task: asyncio.Task | None = None
+    fd: int = -1
+
+
 class PaneWatcher:
     """Watches tmux pane output via pipe-pane and notifies on changes.
 
@@ -37,6 +47,7 @@ class PaneWatcher:
 
     def __init__(self) -> None:
         self._watches: dict[str, _PaneWatch] = {}
+        self._state_watches: dict[str, _FileWatch] = {}
         self._pipe_dir = Path(tempfile.mkdtemp(prefix="sw-pipes-"))
         PaneWatcher._active_pipe_dirs.add(self._pipe_dir)
         self._running = True
@@ -74,7 +85,7 @@ class PaneWatcher:
         # Start async file watcher
         try:
             loop = asyncio.get_running_loop()
-            watch.task = loop.create_task(self._watch_file(watch))
+            watch.task = loop.create_task(self._watch_pipe_file(watch))
         except RuntimeError:
             # No running loop — caller will need to handle fallback polling
             logger.debug("No event loop available for file watching")
@@ -112,8 +123,51 @@ class PaneWatcher:
         except OSError:
             pass
 
-    async def _watch_file(self, watch: _PaneWatch) -> None:
-        """Watch a file for modifications using kqueue."""
+    def start_watching_state(self, session_name: str, callback: Callable) -> None:
+        """Watch a session's state file for changes via kqueue.
+
+        The state file is written by sw-hook.sh on Claude state transitions.
+        Calls callback(session_name) when the file changes.
+        """
+        if session_name in self._state_watches:
+            self.stop_watching_state(session_name)
+
+        from super_worker.constants import SESSION_STATES_DIR
+        state_file = SESSION_STATES_DIR / session_name
+
+        # Ensure the state dir and file exist so kqueue can watch
+        SESSION_STATES_DIR.mkdir(parents=True, exist_ok=True)
+        state_file.touch()
+
+        watch = _FileWatch(
+            path=state_file,
+            callback=callback,
+        )
+        self._state_watches[session_name] = watch
+
+        try:
+            loop = asyncio.get_running_loop()
+            watch.task = loop.create_task(self._watch_state_file(watch, session_name))
+        except RuntimeError:
+            logger.debug("No event loop available for state file watching")
+
+    def stop_watching_state(self, session_name: str) -> None:
+        """Stop watching a session's state file."""
+        watch = self._state_watches.pop(session_name, None)
+        if watch is None:
+            return
+
+        if watch.task is not None:
+            watch.task.cancel()
+
+        if watch.fd >= 0:
+            try:
+                os.close(watch.fd)
+            except OSError:
+                pass
+
+    async def _watch_pipe_file(self, watch: _PaneWatch) -> None:
+        """Watch a pipe file for modifications using kqueue. Truncates after each event."""
         try:
             fd = os.open(str(watch.pipe_path), os.O_RDONLY)
             watch.fd = fd
@@ -137,6 +191,14 @@ class PaneWatcher:
                 if events:
                     # Debounce: wait for burst writes to settle
                     await asyncio.sleep(0.016)
+
+                    # Truncate the pipe file to prevent unbounded growth.
+                    # The file is only a notification channel — we never read it.
+                    try:
+                        os.truncate(watch.pipe_path, 0)
+                    except OSError:
+                        pass
+
                     try:
                         watch.callback()
                     except Exception:
@@ -151,11 +213,49 @@ class PaneWatcher:
             except Exception:
                 pass
 
+    async def _watch_state_file(self, watch: _FileWatch, session_name: str) -> None:
+        """Watch a state file for modifications using kqueue."""
+        try:
+            fd = os.open(str(watch.path), os.O_RDONLY)
+            watch.fd = fd
+        except OSError:
+            logger.debug("Failed to open state file for watching: %s", watch.path)
+            return
+
+        try:
+            kq = select.kqueue()
+            event = select.kevent(
+                fd,
+                filter=select.KQ_FILTER_VNODE,
+                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                fflags=select.KQ_NOTE_WRITE,
+            )
+            kq.control([event], 0, 0)
+
+            while self._running:
+                events = await asyncio.to_thread(kq.control, None, 1, 0.5)
+                if events:
+                    try:
+                        watch.callback(session_name)
+                    except Exception:
+                        logger.debug("State watcher callback error", exc_info=True)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("State file watcher error for %s", session_name, exc_info=True)
+        finally:
+            try:
+                kq.close()
+            except Exception:
+                pass
+
     def cleanup(self) -> None:
         """Stop all watches, remove temp dir."""
         self._running = False
         for name in list(self._watches):
             self.stop_watching(name)
+        for name in list(self._state_watches):
+            self.stop_watching_state(name)
         PaneWatcher._active_pipe_dirs.discard(self._pipe_dir)
         import shutil
         try:
