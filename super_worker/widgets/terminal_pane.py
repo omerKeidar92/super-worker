@@ -112,6 +112,39 @@ class TerminalPane(Widget, can_focus=True):
             self._poll_pane()  # Initial capture
             self._fallback_timer = self.set_interval(PANE_FALLBACK_POLL_S, self._poll_pane)
 
+    def pause_watching(self) -> None:
+        """Stop pipe-pane output watching without clearing content or state watches.
+
+        Called when the worktree tab becomes inactive. Preserves displayed
+        content and active_session so resuming is seamless.
+        """
+        session = self.active_session
+        if session:
+            self._watcher.stop_watching(session)
+        if self._fallback_timer is not None:
+            self._fallback_timer.stop()
+            self._fallback_timer = None
+        if self._trailing_timer is not None:
+            self._trailing_timer.stop()
+            self._trailing_timer = None
+
+    def resume_watching(self) -> None:
+        """Restart pipe-pane output watching after a pause.
+
+        Called when the worktree tab becomes active again. Does a fresh
+        capture and restarts the kqueue watcher + fallback timer.
+        """
+        session = self.active_session
+        if not session:
+            return
+        # Avoid double-watching if already active
+        if session in self._watcher._watches:
+            return
+        self._watcher.start_watching(session, self._on_pane_output)
+        self._last_hash = _NO_HASH  # Force re-render
+        self._poll_pane()
+        self._fallback_timer = self.set_interval(PANE_FALLBACK_POLL_S, self._poll_pane)
+
     def start_watching_states(self, session_names: list[str]) -> None:
         """Start watching state files for all given sessions.
 

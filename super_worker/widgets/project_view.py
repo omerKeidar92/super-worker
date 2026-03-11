@@ -217,12 +217,12 @@ class ProjectView(Widget):
             pass
 
     def _set_active_worktree(self, wt: Worktree) -> None:
-        # Deactivate the old worktree's terminal to stop pipe-pane + kqueue
+        # Pause the old worktree's terminal captures (keeps content + state watches)
         old_wt = self._active_worktree
         if old_wt and old_wt.name != wt.name:
             try:
                 old_wtc = self.query_one(f"#wtc-{old_wt.name}", WorktreeTabContent)
-                old_wtc.query_one(TerminalPane).active_session = None
+                old_wtc.query_one(TerminalPane).pause_watching()
             except Exception:
                 pass
         self._active_worktree = wt
@@ -244,6 +244,7 @@ class ProjectView(Widget):
                 wtc.query_one(SessionSidebar).select_session(tmux_session_name)
                 terminal = wtc.query_one(TerminalPane)
                 terminal.active_session = tmux_session_name
+                terminal.resume_watching()
                 terminal.focus()
             except Exception:
                 pass
