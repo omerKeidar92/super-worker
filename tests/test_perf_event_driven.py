@@ -270,17 +270,19 @@ class TestSendKeysNoEnvSet:
 
 
 class TestFallbackPollInterval:
-    """Verify fallback poll interval is no longer aggressive."""
+    """Verify fallback poll interval is fast enough for responsive typing display."""
 
-    def test_fallback_poll_is_safety_net(self):
+    def test_fallback_poll_fast_enough_for_typing(self):
         from super_worker.constants import PANE_FALLBACK_POLL_S
-        # Should be >= 2s — kqueue handles real-time, this is just safety net
-        assert PANE_FALLBACK_POLL_S >= 2.0
+        # set_interval fires its callback directly (bypasses message queue),
+        # so the fallback poll IS what updates the display during typing.
+        # Must be <= 500ms to feel responsive.
+        assert PANE_FALLBACK_POLL_S <= 0.5
 
-    def test_fallback_poll_not_aggressive(self):
+    def test_fallback_poll_not_too_aggressive(self):
         from super_worker.constants import PANE_FALLBACK_POLL_S
-        # Should not be the old 0.3s aggressive poll
-        assert PANE_FALLBACK_POLL_S != 0.3
+        # Should not be sub-50ms (excessive tmux subprocess calls)
+        assert PANE_FALLBACK_POLL_S >= 0.05
 
 
 class TestPeriodicRefreshLightweight:
@@ -457,6 +459,10 @@ async def test_debounce_coalesces_burst_events(mock_tmux):
         terminal.active_session = "sw-test-0"
         await pilot.pause(delay=0.2)
 
+        # Pause the fallback timer so only kqueue debounce is measured
+        if terminal._fallback_timer is not None:
+            terminal._fallback_timer.pause()
+
         # Reset count after initial activity
         poll_count = 0
 
@@ -465,6 +471,10 @@ async def test_debounce_coalesces_burst_events(mock_tmux):
             terminal._on_pane_output()
         # Wait for trailing timer + processing
         await pilot.pause(delay=0.2)
+
+        # Resume fallback timer
+        if terminal._fallback_timer is not None:
+            terminal._fallback_timer.resume()
 
         # Time-based debounce: first event triggers call_later (immediate),
         # remaining events are throttled, trailing timer fires once.
