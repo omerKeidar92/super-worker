@@ -6,7 +6,7 @@ import os
 import select
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -48,6 +48,8 @@ class PaneWatcher:
             self.stop_watching(session_name)
 
         pipe_path = self._pipe_dir / f"{session_name}.pipe"
+        # Ensure pipe dir still exists (may have been cleaned by another instance)
+        self._pipe_dir.mkdir(parents=True, exist_ok=True)
         # Create the file so kqueue can watch it
         pipe_path.touch()
 

@@ -199,14 +199,25 @@ class ProjectView(Widget):
         if wt.sessions:
             first = wt.sessions[0]
             self._active_session_name = first.tmux_session_name
+            self._activate_terminal(wt.name, first.tmux_session_name)
+            self._update_app_subtitle(first.label)
+
+    def _activate_terminal(self, wt_name: str, tmux_session_name: str) -> None:
+        """Set the active session on a worktree's terminal pane.
+
+        Uses call_after_refresh so it works even when the widget tree
+        hasn't fully composed yet (e.g. initial mount race).
+        """
+        def _do_activate() -> None:
             try:
-                wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
-                wtc.query_one(SessionSidebar).select_session(first.tmux_session_name)
+                wtc = self.query_one(f"#wtc-{wt_name}", WorktreeTabContent)
+                wtc.query_one(SessionSidebar).select_session(tmux_session_name)
                 terminal = wtc.query_one(TerminalPane)
-                terminal.active_session = first.tmux_session_name
+                terminal.active_session = tmux_session_name
+                terminal.focus()
             except Exception:
                 pass
-            self._update_app_subtitle(first.label)
+        self.call_after_refresh(_do_activate)
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         tab_id = event.pane.id
@@ -351,8 +362,11 @@ class ProjectView(Widget):
                 return
 
             self._state.worktrees.append(wt)
-            if prompt:
-                session = await asyncio.to_thread(create_session, wt, prompt=prompt, label=prompt, skip_permissions=skip_permissions)
+            if prompt or skip_permissions:
+                session = await asyncio.to_thread(
+                    create_session, wt, prompt=prompt, label=prompt,
+                    skip_permissions=skip_permissions,
+                )
                 wt.sessions.append(session)
             await asyncio.to_thread(save_state, self._state, self._config)
             await self._add_worktree_tab(wt)
@@ -400,11 +414,7 @@ class ProjectView(Widget):
 
                 self._active_session_name = session.tmux_session_name
                 await self._refresh_sidebar(wt)
-                wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
-                wtc.query_one(SessionSidebar).select_session(session.tmux_session_name)
-                terminal = wtc.query_one(TerminalPane)
-                terminal.active_session = session.tmux_session_name
-                terminal.focus()
+                self._activate_terminal(wt.name, session.tmux_session_name)
                 self.app.notify(f"Created session: {session.label}")
 
             self.run_worker(_create_session, exclusive=False)
