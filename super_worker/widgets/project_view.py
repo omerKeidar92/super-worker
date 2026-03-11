@@ -217,6 +217,14 @@ class ProjectView(Widget):
             pass
 
     def _set_active_worktree(self, wt: Worktree) -> None:
+        # Deactivate the old worktree's terminal to stop pipe-pane + kqueue
+        old_wt = self._active_worktree
+        if old_wt and old_wt.name != wt.name:
+            try:
+                old_wtc = self.query_one(f"#wtc-{old_wt.name}", WorktreeTabContent)
+                old_wtc.query_one(TerminalPane).active_session = None
+            except Exception:
+                pass
         self._active_worktree = wt
         if wt.sessions:
             first = wt.sessions[0]
