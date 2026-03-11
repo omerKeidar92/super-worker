@@ -14,6 +14,7 @@ TUI and CLI for managing multiple Claude Code sessions across git worktrees.
 - **Git operations** — commit, push, pull, and create PRs per worktree from the sidebar
 - **Crash recovery** — dead sessions are automatically respawned on startup
 - **Configurable** — per-project `.sw.toml` with auto-detection of remote, branch, and repo structure
+- **Fast mode** — native tmux panes with zero rendering overhead (`sw --fast`)
 - **CLI** — script worktree and session management from the command line
 
 ## Prerequisites
@@ -122,10 +123,29 @@ The sidebar provides per-worktree git operations:
 - Attention indicators (🔔) show across all open projects
 - State persists per-project across sessions
 
+## Fast Mode
+
+Fast mode runs sessions as native tmux panes — no TUI overhead, direct terminal interaction.
+
+```bash
+sw --fast
+```
+
+All actions are available through a single menu: press **Ctrl+B, Space** to open it.
+
+| Key | Action |
+|---|---|
+| Ctrl+B, Space | Open master menu (worktrees, sessions, git, settings) |
+| Ctrl+B, g | Git actions menu |
+| Ctrl+B, n / p | Switch between worktree tabs |
+
+Sessions with previous conversations resume automatically with `--continue` on relaunch.
+
 ## CLI
 
 ```bash
 sw                                     # Launch TUI
+sw --fast                              # Launch fast mode (native tmux panes)
 sw new my-feature --prompt "/plan"     # Create worktree + session
 sw add my-feature --prompt "/execute"  # Add session to existing worktree
 sw list                                # List worktrees and sessions
