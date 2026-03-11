@@ -8,13 +8,13 @@ TUI and CLI for managing multiple Claude Code sessions across git worktrees.
 - **Live terminal preview** — see session output in real-time via kqueue + tmux pipe-pane
 - **Full attach mode** — press Ctrl+A to drop into the tmux session directly
 - **Session state indicators** — live dots show running, waiting for input, or waiting for approval
-- **Attention alerts** — 🔔 appears on worktree tabs and project bar when a session needs approval
+- **Attention alerts** — appears on worktree tabs and project bar when a session needs approval
 - **Multi-project support** — switch between repos with a project drawer or docked tab bar
 - **Terminal sessions** — open plain shell sessions alongside Claude Code
-- **Git operations** — commit, push, pull, and create PRs per worktree from the sidebar
-- **Crash recovery** — dead sessions are automatically respawned on startup
-- **Configurable** — per-project `.sw.toml` with auto-detection of remote, branch, and repo structure
+- **Git operations** — commit, push, pull, and create PRs per worktree
+- **Crash recovery** — dead sessions are automatically respawned on startup with `--continue`
 - **Fast mode** — native tmux panes with zero rendering overhead (`sw --fast`)
+- **Configurable** — per-project `.sw.toml` with auto-detection of remote, branch, and repo structure
 - **CLI** — script worktree and session management from the command line
 
 ## Prerequisites
@@ -23,6 +23,7 @@ TUI and CLI for managing multiple Claude Code sessions across git worktrees.
 - Python 3.11+
 - [tmux](https://github.com/tmux/tmux)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`)
+- [GitHub CLI](https://cli.github.com/) (`gh`) — optional, for PR creation
 
 ## Install
 
@@ -31,6 +32,8 @@ git clone https://github.com/okeidar/super-worker.git
 cd super-worker
 ./setup.sh
 ```
+
+The setup script auto-detects your package manager (brew/apt/dnf/pacman), installs tmux if needed, and registers `sw` globally via pipx.
 
 Or manually with [pipx](https://pipx.pypa.io/):
 
@@ -46,18 +49,22 @@ This makes `sw` available globally from any terminal.
 Navigate to any git repository and run:
 
 ```bash
-sw
+sw           # TUI mode
+sw --fast    # Fast mode (native tmux panes)
 ```
 
-From the TUI:
+### TUI Mode
 
-1. **Ctrl+N** — create a new worktree (with optional branch and initial prompt)
+1. **Ctrl+N** — create a new worktree (with optional branch, prompt, and skip-permissions)
 2. **Ctrl+S** — add a session to the current worktree
 3. **Ctrl+A** — attach directly to the active tmux session
-4. **Ctrl+T** — open a plain terminal session
-5. Click sessions in the sidebar to switch between them
+4. Click sessions in the sidebar to switch between them
 
-## Keybindings
+### Fast Mode
+
+All actions through one menu: **Ctrl+B, Space**.
+
+## TUI Keybindings
 
 | Key | Action |
 |---|---|
@@ -81,75 +88,97 @@ From the TUI:
 | Del | Remove project from registry |
 | Esc | Close drawer |
 
+## Fast Mode
+
+Fast mode runs sessions as native tmux panes — no TUI rendering overhead, direct terminal interaction.
+
+```bash
+sw --fast
+```
+
+| Key | Action |
+|---|---|
+| Ctrl+B, Space | Master menu (worktrees, sessions, git, settings) |
+| Ctrl+B, g | Git actions menu |
+| Ctrl+B, n / p | Switch between worktree tabs |
+
+### Master Menu Actions
+
+**Worktrees:** new worktree, delete worktree
+**Sessions:** new session (split pane), kill pane, rename session, resume dead pane
+**Git:** commit, push, pull, open PR
+**Other:** switch project, open in terminal, edit settings, help
+
+Sessions with previous conversations resume automatically with `--continue` on relaunch.
+
+Window titles show branch status: `worktree (branch ↑ahead↓behind)` with `*` for dirty and `!` for sessions needing approval.
+
 ## Worktree Management
 
 When creating a worktree you can:
 
 - **Create a new branch** (default) — auto-named with a configurable prefix
 - **Use an existing branch** — check "Use existing branch" and provide the branch name
+- **Specify a branch name** — use `--branch` / `-b` in the CLI
 - **Detached HEAD** — create a worktree with no branch
 
 When deleting a worktree, you can optionally delete the branch (both local and remote).
 
 ## Session Types
 
-- **Claude Code** — runs `claude` with an optional prompt (e.g., `/plan`). Supports `--dangerously-skip-permissions` and `--continue` for resuming.
+- **Claude Code** — runs `claude` with an optional prompt (e.g., `/plan`). Supports `--dangerously-skip-permissions` via the skip-permissions checkbox/flag and `--continue` for resuming.
 - **Terminal** — plain shell session for running commands, git operations, etc.
+
+### Session Options
+
+- **Prompt** — initial prompt sent to Claude Code on launch
+- **Label** — custom display name for the session
+- **Skip permissions** — launches Claude with `--dangerously-skip-permissions`
 
 ## Session States
 
 Each session shows a colored dot indicating its state:
 
-- 🟢 **Running** — session executing normally
-- 🟡 **Waiting for input** — session blocked, waiting for user input
-- 🟣 **Waiting for approval** — session needs user interaction
-- 🔴 **Dead** — session exited (auto-recovered on startup)
+- **Running** (green) — session executing normally
+- **Waiting for input** (yellow) — session blocked, waiting for user input
+- **Waiting for approval** (magenta) — session needs user approval
+- **Dead** (red) — session exited (auto-recovered on startup)
 
-When any session is waiting for approval, a 🔔 appears on the worktree tab and project bar.
+State detection uses a Claude Code hook (`sw-hook.sh`) that's automatically installed. In fast mode, pane border titles also update with state icons.
 
 ## Git Actions
 
-The sidebar provides per-worktree git operations:
+Per-worktree git operations available from the TUI sidebar or fast mode menu:
 
 - **Commit** — stages tracked changes and commits with a message
 - **Push** — pushes to remote
 - **Pull** — pulls from the main branch
 - **Open PR** — creates a pull request via `gh pr create`
 
+The sidebar also shows branch ahead/behind status and dirty working tree indicators.
+
 ## Multi-Project Support
 
 - **Ctrl+O** opens the project drawer to switch repos
 - Projects can be docked as a tab bar above worktree tabs (press `p` in the drawer)
-- Attention indicators (🔔) show across all open projects
+- Attention indicators show across all open projects when sessions need approval
 - State persists per-project across sessions
-
-## Fast Mode
-
-Fast mode runs sessions as native tmux panes — no TUI overhead, direct terminal interaction.
-
-```bash
-sw --fast
-```
-
-All actions are available through a single menu: press **Ctrl+B, Space** to open it.
-
-| Key | Action |
-|---|---|
-| Ctrl+B, Space | Open master menu (worktrees, sessions, git, settings) |
-| Ctrl+B, g | Git actions menu |
-| Ctrl+B, n / p | Switch between worktree tabs |
-
-Sessions with previous conversations resume automatically with `--continue` on relaunch.
+- **Del** removes a project from the registry
 
 ## CLI
 
 ```bash
 sw                                     # Launch TUI
 sw --fast                              # Launch fast mode (native tmux panes)
-sw new my-feature --prompt "/plan"     # Create worktree + session
-sw add my-feature --prompt "/execute"  # Add session to existing worktree
+sw new my-feature                      # Create worktree with auto-named branch
+sw new my-feature -b existing-branch   # Create worktree on existing branch
+sw new my-feature -p "/plan"           # Create worktree + session with prompt
+sw new my-feature -s                   # Create worktree with skip-permissions
+sw add my-feature -p "/execute"        # Add session to existing worktree
+sw add my-feature -l "tests" -s        # Add labeled session with skip-permissions
 sw list                                # List worktrees and sessions
 sw cleanup my-feature                  # Kill sessions and remove worktree
+sw cleanup my-feature -f               # Force remove even with uncommitted changes
 sw config                              # Show current config
 sw config worktree.branch_prefix sc-   # Set a config value
 ```
@@ -183,6 +212,8 @@ remote = "origin"
 
 [ui]
 commit_placeholder = "Brief description of changes"
+name_placeholder = "worktree name"
+branch_placeholder = "branch name"
 ```
 
 Global defaults go in `~/.config/sw/config.toml` (same format). Project settings override global.
