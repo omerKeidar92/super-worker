@@ -1,3 +1,4 @@
+import concurrent.futures
 import logging
 import re
 
@@ -72,6 +73,12 @@ class TerminalPane(Widget, can_focus=True):
         self._last_successful_render: float = 0.0
         self._watcher = PaneWatcher()
         self._watched_state_sessions: set[str] = set()
+        # Single-thread executor guarantees FIFO key delivery.
+        # run_worker without exclusive=True spawns concurrent workers that can
+        # race each other, causing characters to arrive at tmux out of order.
+        self._send_keys_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sw-send-keys"
+        )
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="terminal-scroll"):
@@ -190,17 +197,14 @@ class TerminalPane(Widget, can_focus=True):
             self._fallback_timer.stop()
             self._fallback_timer = None
         self._watcher.cleanup()
+        self._send_keys_executor.shutdown(wait=False)
 
     def _send_keys_async(self, *keys: str, literal: bool = False) -> None:
-        """Send keys off the event loop."""
+        """Send keys off the event loop, in-order via a single-thread executor."""
         session = self.active_session
         if not session:
             return
-        self.run_worker(
-            lambda: send_keys(session, *keys, literal=literal),
-            thread=True,
-            group="send-keys",
-        )
+        self._send_keys_executor.submit(send_keys, session, *keys, literal=literal)
 
     def on_click(self, event: Click) -> None:
         """Consume clicks so the Static child doesn't trigger text selection."""
